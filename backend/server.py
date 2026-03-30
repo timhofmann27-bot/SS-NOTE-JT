@@ -5,15 +5,17 @@ from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Depend
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
+from bson.errors import InvalidId
 import os
 import logging
 import bcrypt
 import jwt
 import secrets
 import json
+import re
 from pathlib import Path
-from pydantic import BaseModel, Field
-from typing import List, Optional
+from pydantic import BaseModel, Field, field_validator
+from typing import List, Optional, Literal
 from datetime import datetime, timezone, timedelta
 
 # Configure logging
@@ -32,43 +34,107 @@ JWT_ALGORITHM = "HS256"
 app = FastAPI(title="444.HEIMAT-FUNK API")
 api_router = APIRouter(prefix="/api")
 
+# Exception handler for invalid ObjectIds
+from fastapi.responses import JSONResponse
+
+@app.exception_handler(InvalidId)
+async def invalid_id_handler(request: Request, exc: InvalidId):
+    return JSONResponse(status_code=400, content={"detail": "Ungültige ID"})
+
+# ==================== VALID VALUES ====================
+
+VALID_SECURITY_LEVELS = ["UNCLASSIFIED", "RESTRICTED", "CONFIDENTIAL", "SECRET"]
+VALID_TRUST_LEVELS = ["UNVERIFIED", "VERIFIED", "TRUSTED", "BLOCKED"]
+
+EMAIL_REGEX = re.compile(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$')
+
+def validate_object_id(oid: str) -> ObjectId:
+    """Safe ObjectId conversion with proper error handling"""
+    try:
+        return ObjectId(oid)
+    except (InvalidId, TypeError):
+        raise HTTPException(status_code=400, detail=f"Ungültige ID: {oid[:50]}")
+
 # ==================== MODELS ====================
 
 class RegisterInput(BaseModel):
     email: str
-    password: str
-    name: str
-    callsign: Optional[str] = None
+    password: str = Field(min_length=8, max_length=128)
+    name: str = Field(min_length=1, max_length=100)
+    callsign: Optional[str] = Field(default=None, max_length=20)
+
+    @field_validator('email')
+    @classmethod
+    def validate_email(cls, v: str) -> str:
+        v = v.strip().lower()
+        if not EMAIL_REGEX.match(v):
+            raise ValueError('Ungültige E-Mail-Adresse')
+        return v
+
+    @field_validator('password')
+    @classmethod
+    def validate_password(cls, v: str) -> str:
+        if len(v) < 8:
+            raise ValueError('Passwort muss mindestens 8 Zeichen haben')
+        return v
 
 class LoginInput(BaseModel):
     email: str
     password: str
 
 class ProfileUpdate(BaseModel):
-    name: Optional[str] = None
-    callsign: Optional[str] = None
-    status_text: Optional[str] = None
-    avatar_base64: Optional[str] = None
+    name: Optional[str] = Field(default=None, max_length=100)
+    callsign: Optional[str] = Field(default=None, max_length=20)
+    status_text: Optional[str] = Field(default=None, max_length=200)
+    avatar_base64: Optional[str] = Field(default=None, max_length=500000)  # ~375KB max
 
 class ContactAdd(BaseModel):
     user_id: str
     trust_level: str = "UNVERIFIED"
 
+    @field_validator('trust_level')
+    @classmethod
+    def validate_trust(cls, v: str) -> str:
+        if v not in VALID_TRUST_LEVELS:
+            raise ValueError(f'Ungültiger Trust-Level. Erlaubt: {VALID_TRUST_LEVELS}')
+        return v
+
 class ChatCreate(BaseModel):
     participant_ids: List[str]
-    name: Optional[str] = None
+    name: Optional[str] = Field(default=None, max_length=100)
     is_group: bool = False
     group_role_map: Optional[dict] = None
     security_level: str = "UNCLASSIFIED"
 
+    @field_validator('security_level')
+    @classmethod
+    def validate_sec(cls, v: str) -> str:
+        if v not in VALID_SECURITY_LEVELS:
+            raise ValueError(f'Ungültige Sicherheitsstufe. Erlaubt: {VALID_SECURITY_LEVELS}')
+        return v
+
 class MessageSend(BaseModel):
     chat_id: str
-    content: str
+    content: str = Field(min_length=1, max_length=10000)
     message_type: str = "text"
     security_level: str = "UNCLASSIFIED"
-    self_destruct_seconds: Optional[int] = None
+    self_destruct_seconds: Optional[int] = Field(default=None, ge=5, le=604800)
     is_emergency: bool = False
-    media_base64: Optional[str] = None
+    media_base64: Optional[str] = Field(default=None, max_length=5000000)  # ~3.75MB max
+
+    @field_validator('security_level')
+    @classmethod
+    def validate_sec(cls, v: str) -> str:
+        if v not in VALID_SECURITY_LEVELS:
+            raise ValueError(f'Ungültige Sicherheitsstufe. Erlaubt: {VALID_SECURITY_LEVELS}')
+        return v
+
+    @field_validator('content')
+    @classmethod
+    def validate_content(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError('Nachricht darf nicht leer sein')
+        return v
 
 class MessageAck(BaseModel):
     message_ids: List[str]
@@ -195,14 +261,47 @@ async def register(input: RegisterInput, response: Response):
     return {"user": user_doc, "token": access_token}
 
 @api_router.post("/auth/login")
-async def login(input: LoginInput, response: Response):
+async def login(input: LoginInput, request: Request, response: Response):
     email = input.email.lower().strip()
+    
+    # Rate limiting: Check brute force attempts
+    client_ip = request.client.host if request.client else "unknown"
+    identifier = f"{client_ip}:{email}"
+    attempt = await db.login_attempts.find_one({"identifier": identifier})
+    if attempt:
+        locked_until = attempt.get("locked_until")
+        now = datetime.now(timezone.utc)
+        if locked_until:
+            # Ensure timezone-aware comparison
+            if locked_until.tzinfo is None:
+                locked_until = locked_until.replace(tzinfo=timezone.utc)
+            if locked_until > now:
+                remaining = int((locked_until - now).total_seconds())
+                raise HTTPException(status_code=429, detail=f"Zu viele Fehlversuche. Gesperrt für {remaining} Sekunden.")
+            else:
+                # Lockout expired, reset
+                await db.login_attempts.delete_one({"identifier": identifier})
+                attempt = None
+        elif attempt.get("count", 0) >= 5:
+            # Set lockout now
+            await db.login_attempts.update_one(
+                {"identifier": identifier},
+                {"$set": {"locked_until": now + timedelta(minutes=15)}}
+            )
+            raise HTTPException(status_code=429, detail="Zu viele Fehlversuche. Gesperrt für 900 Sekunden.")
+    
     user = await db.users.find_one({"email": email})
     if not user:
+        # Track failed attempt
+        await _track_failed_login(identifier)
         raise HTTPException(status_code=401, detail="Ungültige Anmeldedaten")
     
     if not verify_password(input.password, user["password_hash"]):
+        await _track_failed_login(identifier)
         raise HTTPException(status_code=401, detail="Ungültige Anmeldedaten")
+    
+    # Clear failed attempts on success
+    await db.login_attempts.delete_one({"identifier": identifier})
     
     user_id = str(user["_id"])
     await db.users.update_one({"_id": user["_id"]}, {"$set": {"status": "online", "last_seen": datetime.now(timezone.utc)}})
@@ -214,6 +313,23 @@ async def login(input: LoginInput, response: Response):
     response.set_cookie(key="refresh_token", value=refresh_token, httponly=True, secure=False, samesite="lax", max_age=2592000, path="/")
     
     return {"user": serialize_user(user), "token": access_token}
+
+async def _track_failed_login(identifier: str):
+    """Track failed login attempt for brute force protection"""
+    attempt = await db.login_attempts.find_one({"identifier": identifier})
+    if attempt:
+        new_count = attempt.get("count", 0) + 1
+        update: dict = {"$set": {"count": new_count, "last_attempt": datetime.now(timezone.utc)}}
+        if new_count >= 5:
+            update["$set"]["locked_until"] = datetime.now(timezone.utc) + timedelta(minutes=15)
+        await db.login_attempts.update_one({"identifier": identifier}, update)
+    else:
+        await db.login_attempts.insert_one({
+            "identifier": identifier,
+            "count": 1,
+            "last_attempt": datetime.now(timezone.utc),
+            "locked_until": None,
+        })
 
 @api_router.get("/auth/me")
 async def get_me(user: dict = Depends(get_current_user)):
@@ -453,11 +569,17 @@ async def mark_read(input: MessageAck, user: dict = Depends(get_current_user)):
 
 @api_router.get("/messages/poll/{chat_id}")
 async def poll_messages(chat_id: str, after: Optional[str] = None, user: dict = Depends(get_current_user)):
-    query = {"chat_id": chat_id}
+    # SECURITY FIX: Verify chat membership before allowing poll
+    oid = validate_object_id(chat_id)
+    chat = await db.chats.find_one({"_id": oid, "participant_ids": validate_object_id(user["id"])})
+    if not chat:
+        raise HTTPException(status_code=404, detail="Chat nicht gefunden")
+    
+    query: dict = {"chat_id": chat_id}
     if after:
         try:
             query["_id"] = {"$gt": ObjectId(after)}
-        except Exception:
+        except (InvalidId, TypeError):
             pass
     
     messages = await db.messages.find(query).sort("created_at", 1).to_list(100)
@@ -489,6 +611,11 @@ async def poll_chat_updates(user: dict = Depends(get_current_user)):
 
 @api_router.post("/typing/{chat_id}")
 async def set_typing(chat_id: str, user: dict = Depends(get_current_user)):
+    # Verify user is a chat participant
+    oid = validate_object_id(chat_id)
+    chat = await db.chats.find_one({"_id": oid, "participant_ids": validate_object_id(user["id"])})
+    if not chat:
+        raise HTTPException(status_code=404, detail="Chat nicht gefunden")
     await db.typing.update_one(
         {"chat_id": chat_id, "user_id": user["id"]},
         {"$set": {"user_id": user["id"], "chat_id": chat_id, "name": user.get("name", ""), "at": datetime.now(timezone.utc)}},
@@ -498,6 +625,11 @@ async def set_typing(chat_id: str, user: dict = Depends(get_current_user)):
 
 @api_router.get("/typing/{chat_id}")
 async def get_typing(chat_id: str, user: dict = Depends(get_current_user)):
+    # Verify user is a chat participant
+    oid = validate_object_id(chat_id)
+    chat = await db.chats.find_one({"_id": oid, "participant_ids": validate_object_id(user["id"])})
+    if not chat:
+        raise HTTPException(status_code=404, detail="Chat nicht gefunden")
     cutoff = datetime.now(timezone.utc) - timedelta(seconds=5)
     typers = await db.typing.find({"chat_id": chat_id, "user_id": {"$ne": user["id"]}, "at": {"$gt": cutoff}}).to_list(10)
     return {"typing": [{"user_id": t["user_id"], "name": t["name"]} for t in typers]}
@@ -513,6 +645,8 @@ async def startup():
     await db.messages.create_index([("chat_id", 1), ("created_at", -1)])
     await db.messages.create_index("self_destruct_at", expireAfterSeconds=0)
     await db.typing.create_index("at", expireAfterSeconds=10)
+    await db.login_attempts.create_index("identifier")
+    await db.login_attempts.create_index("locked_until", expireAfterSeconds=900)
     
     # Seed demo users
     admin_email = os.environ.get("ADMIN_EMAIL", "kommandant@heimatfunk.de")
