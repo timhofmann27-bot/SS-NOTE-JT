@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { View, Text, TouchableOpacity, StyleSheet, ScrollView, TextInput, Alert, ActivityIndicator } from 'react-native';
+import { View, Text, TouchableOpacity, StyleSheet, ScrollView, TextInput, Alert, ActivityIndicator, Image } from 'react-native';
 import { useRouter } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
 import { useAuth } from '../../src/context/AuthContext';
@@ -18,6 +18,8 @@ export default function SettingsScreen() {
   const [changingPk, setChangingPk] = useState(false);
   const [pkMsg, setPkMsg] = useState('');
   const [deleting, setDeleting] = useState(false);
+  const [qrData, setQrData] = useState<string | null>(null);
+  const [qrLoading, setQrLoading] = useState(false);
 
   const handleSave = async () => {
     try {
@@ -55,6 +57,20 @@ export default function SettingsScreen() {
     } catch (e: any) {
       console.log('Delete error', e);
       setDeleting(false);
+    }
+  };
+
+  const handleGenerateQR = async () => {
+    setQrLoading(true);
+    try {
+      const res = await authAPI.createMagicQR();
+      setQrData(res.data.qr_base64);
+      // Auto-expire QR display after 5 minutes
+      setTimeout(() => setQrData(null), 300000);
+    } catch (e) {
+      console.log('QR error', e);
+    } finally {
+      setQrLoading(false);
     }
   };
 
@@ -148,6 +164,26 @@ export default function SettingsScreen() {
             <Text style={styles.fieldLabel}>Username</Text>
             <Text style={styles.fieldValue}>@{user?.username}</Text>
           </View>
+        </View>
+      </View>
+
+      {/* QR Magic Login */}
+      <View style={styles.section}>
+        <Text style={styles.sectionTitle}>CROSS-DEVICE LOGIN</Text>
+        <View style={styles.fieldCard}>
+          {qrData ? (
+            <View style={styles.qrContainer}>
+              <Image source={{ uri: qrData }} style={styles.qrImage} resizeMode="contain" />
+              <Text style={styles.qrHint}>Scanne diesen QR-Code mit einem anderen Gerät um dich dort automatisch anzumelden</Text>
+              <Text style={styles.qrTimer}>Gültig für 5 Minuten</Text>
+            </View>
+          ) : (
+            <TouchableOpacity testID="generate-qr-btn" style={styles.qrBtn} onPress={handleGenerateQR} disabled={qrLoading}>
+              {qrLoading ? <ActivityIndicator size="small" color={COLORS.primaryLight} /> : (
+                <><Ionicons name="qr-code" size={20} color={COLORS.primaryLight} /><Text style={styles.qrBtnText}>QR-Code für Geräte-Login generieren</Text></>
+              )}
+            </TouchableOpacity>
+          )}
         </View>
       </View>
 
@@ -246,6 +282,12 @@ const styles = StyleSheet.create({
   },
   deleteText: { fontSize: FONTS.sizes.base, fontWeight: FONTS.weights.bold, color: COLORS.white },
   deleteHint: { fontSize: FONTS.sizes.xs, color: COLORS.textMuted, textAlign: 'center', marginTop: 8, lineHeight: 16 },
+  qrContainer: { alignItems: 'center', padding: 16 },
+  qrImage: { width: 200, height: 200, borderRadius: 8, marginBottom: 12 },
+  qrHint: { fontSize: FONTS.sizes.xs, color: COLORS.textSecondary, textAlign: 'center', lineHeight: 16 },
+  qrTimer: { fontSize: FONTS.sizes.xs, color: COLORS.restricted, fontWeight: FONTS.weights.bold, marginTop: 6 },
+  qrBtn: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, paddingVertical: 14 },
+  qrBtnText: { fontSize: FONTS.sizes.sm, fontWeight: FONTS.weights.semibold, color: COLORS.primaryLight },
   versionInfo: { alignItems: 'center', marginTop: 32, paddingBottom: 20 },
   versionText: { fontSize: FONTS.sizes.sm, color: COLORS.textMuted },
   versionSub: { fontSize: FONTS.sizes.xs, color: COLORS.textMuted, marginTop: 2 },
