@@ -1,4 +1,5 @@
 import axios from 'axios';
+import { io, Socket } from 'socket.io-client';
 
 const BACKEND_URL = process.env.EXPO_PUBLIC_BACKEND_URL || '';
 
@@ -9,6 +10,7 @@ const api = axios.create({
 });
 
 let authToken: string | null = null;
+let socket: Socket | null = null;
 
 export const setAuthToken = (token: string | null) => {
   authToken = token;
@@ -21,6 +23,30 @@ export const setAuthToken = (token: string | null) => {
 
 export const getAuthToken = () => authToken;
 
+// WebSocket connection management
+export const connectSocket = (token: string): Socket => {
+  if (socket?.connected) return socket;
+  socket = io(BACKEND_URL, {
+    path: '/api/socket.io',
+    auth: { token },
+    transports: ['websocket', 'polling'],
+    reconnection: true,
+    reconnectionDelay: 2000,
+    reconnectionAttempts: 10,
+  });
+  socket.on('connect', () => console.log('[WS] Connected'));
+  socket.on('disconnect', () => console.log('[WS] Disconnected'));
+  socket.on('connect_error', (e) => console.log('[WS] Error:', e.message));
+  return socket;
+};
+
+export const disconnectSocket = () => {
+  socket?.disconnect();
+  socket = null;
+};
+
+export const getSocket = () => socket;
+
 // Auth (Anonymous: Username + Passkey)
 export const authAPI = {
   register: (data: { username: string; passkey: string; name: string; callsign?: string }) =>
@@ -31,6 +57,9 @@ export const authAPI = {
   logout: () => api.post('/auth/logout'),
   changePasskey: (data: { old_passkey: string; new_passkey: string }) =>
     api.post('/auth/change-passkey', data),
+  generateUsername: () => api.get('/auth/generate-username'),
+  refresh: () => api.post('/auth/refresh'),
+  deleteAccount: () => api.delete('/auth/account'),
 };
 
 export const usersAPI = {

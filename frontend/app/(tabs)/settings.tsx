@@ -1,9 +1,9 @@
 import React, { useState } from 'react';
-import { View, Text, TouchableOpacity, StyleSheet, ScrollView, TextInput, Alert } from 'react-native';
+import { View, Text, TouchableOpacity, StyleSheet, ScrollView, TextInput, Alert, ActivityIndicator } from 'react-native';
 import { useRouter } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
 import { useAuth } from '../../src/context/AuthContext';
-import { profileAPI } from '../../src/utils/api';
+import { profileAPI, authAPI } from '../../src/utils/api';
 import { COLORS, FONTS, SPACING, ROLES } from '../../src/utils/theme';
 
 export default function SettingsScreen() {
@@ -13,6 +13,11 @@ export default function SettingsScreen() {
   const [name, setName] = useState(user?.name || '');
   const [callsign, setCallsign] = useState(user?.callsign || '');
   const [statusText, setStatusText] = useState(user?.status_text || '');
+  const [oldPasskey, setOldPasskey] = useState('');
+  const [newPasskey, setNewPasskey] = useState('');
+  const [changingPk, setChangingPk] = useState(false);
+  const [pkMsg, setPkMsg] = useState('');
+  const [deleting, setDeleting] = useState(false);
 
   const handleSave = async () => {
     try {
@@ -27,6 +32,30 @@ export default function SettingsScreen() {
   const handleLogout = () => {
     logout();
     router.replace('/login');
+  };
+
+  const handleChangePasskey = async () => {
+    if (!oldPasskey || !newPasskey) { setPkMsg('Fehler: Beide Felder ausfüllen'); return; }
+    if (newPasskey.length < 8) { setPkMsg('Fehler: Min. 8 Zeichen'); return; }
+    setChangingPk(true); setPkMsg('');
+    try {
+      await authAPI.changePasskey({ old_passkey: oldPasskey, new_passkey: newPasskey });
+      setPkMsg('Passkey erfolgreich geändert!');
+      setOldPasskey(''); setNewPasskey('');
+    } catch (e: any) {
+      setPkMsg('Fehler: ' + (e?.response?.data?.detail || 'Unbekannt'));
+    } finally { setChangingPk(false); }
+  };
+
+  const handleDeleteAccount = async () => {
+    setDeleting(true);
+    try {
+      await authAPI.deleteAccount();
+      router.replace('/login');
+    } catch (e: any) {
+      console.log('Delete error', e);
+      setDeleting(false);
+    }
   };
 
   const roleInfo = ROLES[(user?.role || 'soldier') as keyof typeof ROLES] || ROLES.soldier;
@@ -122,6 +151,25 @@ export default function SettingsScreen() {
         </View>
       </View>
 
+      {/* Passkey Change */}
+      <View style={styles.section}>
+        <Text style={styles.sectionTitle}>PASSKEY ÄNDERN</Text>
+        <View style={styles.fieldCard}>
+          <TextInput testID="old-passkey-input" style={styles.passkeyInput} placeholder="Alter Passkey" placeholderTextColor={COLORS.textMuted} secureTextEntry
+            value={oldPasskey} onChangeText={setOldPasskey} />
+          <View style={styles.fieldDivider} />
+          <TextInput testID="new-passkey-input" style={styles.passkeyInput} placeholder="Neuer Passkey (min. 8 Zeichen)" placeholderTextColor={COLORS.textMuted} secureTextEntry
+            value={newPasskey} onChangeText={setNewPasskey} />
+          <View style={styles.fieldDivider} />
+          <TouchableOpacity testID="change-passkey-btn" style={styles.changePasskeyBtn} onPress={handleChangePasskey} disabled={changingPk}>
+            {changingPk ? <ActivityIndicator size="small" color={COLORS.primaryLight} /> : (
+              <><Ionicons name="key" size={16} color={COLORS.primaryLight} /><Text style={styles.changePasskeyText}>Passkey ändern</Text></>
+            )}
+          </TouchableOpacity>
+          {pkMsg ? <Text style={[styles.pkMsg, pkMsg.includes('Fehler') ? {color: COLORS.danger} : {color: COLORS.success}]}>{pkMsg}</Text> : null}
+        </View>
+      </View>
+
       {/* Actions */}
       <View style={styles.section}>
         <Text style={styles.sectionTitle}>AKTIONEN</Text>
@@ -131,9 +179,20 @@ export default function SettingsScreen() {
         </TouchableOpacity>
       </View>
 
+      {/* DSGVO: Account Deletion */}
+      <View style={styles.section}>
+        <Text style={styles.sectionTitle}>GEFAHRENZONE</Text>
+        <TouchableOpacity testID="delete-account-btn" style={styles.deleteBtn} onPress={handleDeleteAccount} disabled={deleting}>
+          {deleting ? <ActivityIndicator size="small" color={COLORS.white} /> : (
+            <><Ionicons name="trash" size={18} color={COLORS.white} /><Text style={styles.deleteText}>Account & alle Daten löschen</Text></>
+          )}
+        </TouchableOpacity>
+        <Text style={styles.deleteHint}>DSGVO Art. 17: Unwiderruflich. Alle Nachrichten, Kontakte und Chatdaten werden gelöscht.</Text>
+      </View>
+
       <View style={styles.versionInfo}>
-        <Text style={styles.versionText}>444.HEIMAT-FUNK v1.0.0</Text>
-        <Text style={styles.versionSub}>DSGVO-konform | BSI-Standard</Text>
+        <Text style={styles.versionText}>444.HEIMAT-FUNK v2.0.0</Text>
+        <Text style={styles.versionSub}>DSGVO-konform | Zero-PII | BSI-Standard</Text>
       </View>
     </ScrollView>
   );
@@ -177,6 +236,16 @@ const styles = StyleSheet.create({
     borderWidth: 1, borderColor: COLORS.danger,
   },
   logoutText: { fontSize: FONTS.sizes.base, fontWeight: FONTS.weights.semibold, color: COLORS.danger },
+  passkeyInput: { color: COLORS.textPrimary, fontSize: FONTS.sizes.md, backgroundColor: COLORS.surfaceLight, borderRadius: 8, paddingHorizontal: 12, paddingVertical: 10, marginVertical: 4 },
+  changePasskeyBtn: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6, paddingVertical: 10, marginTop: 4 },
+  changePasskeyText: { fontSize: FONTS.sizes.sm, fontWeight: FONTS.weights.semibold, color: COLORS.primaryLight },
+  pkMsg: { fontSize: FONTS.sizes.xs, textAlign: 'center', marginTop: 4 },
+  deleteBtn: {
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8,
+    backgroundColor: COLORS.danger, borderRadius: 12, padding: 16,
+  },
+  deleteText: { fontSize: FONTS.sizes.base, fontWeight: FONTS.weights.bold, color: COLORS.white },
+  deleteHint: { fontSize: FONTS.sizes.xs, color: COLORS.textMuted, textAlign: 'center', marginTop: 8, lineHeight: 16 },
   versionInfo: { alignItems: 'center', marginTop: 32, paddingBottom: 20 },
   versionText: { fontSize: FONTS.sizes.sm, color: COLORS.textMuted },
   versionSub: { fontSize: FONTS.sizes.xs, color: COLORS.textMuted, marginTop: 2 },

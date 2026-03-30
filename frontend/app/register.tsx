@@ -4,6 +4,7 @@ import { useRouter } from 'expo-router';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import { useAuth } from '../src/context/AuthContext';
+import { authAPI } from '../src/utils/api';
 import { COLORS, FONTS, SPACING } from '../src/utils/theme';
 
 export default function RegisterScreen() {
@@ -14,8 +15,19 @@ export default function RegisterScreen() {
   const [confirmPasskey, setConfirmPasskey] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
+  const [genLoading, setGenLoading] = useState(false);
   const { register } = useAuth();
   const router = useRouter();
+
+  const generateUsername = async () => {
+    setGenLoading(true);
+    try {
+      const res = await authAPI.generateUsername();
+      setUsername(res.data.username);
+      setCallsign(res.data.username.split('-')[0].toUpperCase() + '-' + res.data.username.split('-')[1]?.toUpperCase().slice(0, 2));
+    } catch { }
+    finally { setGenLoading(false); }
+  };
 
   const handleRegister = async () => {
     if (!username.trim() || !name.trim() || !passkey.trim()) {
@@ -75,12 +87,17 @@ export default function RegisterScreen() {
             ) : null}
 
             <Text style={styles.label}>BENUTZERNAME *</Text>
-            <View style={styles.inputContainer}>
-              <Ionicons name="at-outline" size={18} color={COLORS.textMuted} style={styles.inputIcon} />
-              <TextInput testID="register-username-input" style={styles.input} value={username} onChangeText={setUsername}
-                placeholder="Wähle einen Username (z.B. hawk-7)" placeholderTextColor={COLORS.textMuted} autoCapitalize="none" autoCorrect={false} />
+            <View style={styles.inputRow}>
+              <View style={[styles.inputContainer, { flex: 1 }]}>
+                <Ionicons name="at-outline" size={18} color={COLORS.textMuted} style={styles.inputIcon} />
+                <TextInput testID="register-username-input" style={styles.input} value={username} onChangeText={setUsername}
+                  placeholder="z.B. hawk-7f3e" placeholderTextColor={COLORS.textMuted} autoCapitalize="none" autoCorrect={false} />
+              </View>
+              <TouchableOpacity testID="generate-username-btn" style={styles.genBtn} onPress={generateUsername} disabled={genLoading}>
+                {genLoading ? <ActivityIndicator size="small" color={COLORS.primaryLight} /> : <Ionicons name="dice-outline" size={22} color={COLORS.primaryLight} />}
+              </TouchableOpacity>
             </View>
-            <Text style={styles.hint}>3-30 Zeichen, Buchstaben, Zahlen, - _ .</Text>
+            <Text style={styles.hint}>3-30 Zeichen · Tippe auf den Würfel für einen anonymen Namen</Text>
 
             <Text style={styles.label}>ANZEIGENAME *</Text>
             <View style={styles.inputContainer}>
@@ -151,6 +168,8 @@ const styles = StyleSheet.create({
   form: { gap: 2 },
   label: { fontSize: FONTS.sizes.xs, fontWeight: FONTS.weights.semibold, color: COLORS.textSecondary, letterSpacing: 2, marginTop: 10, marginBottom: 4 },
   hint: { fontSize: 10, color: COLORS.textMuted, marginTop: 2 },
+  inputRow: { flexDirection: 'row', gap: 8, alignItems: 'center' },
+  genBtn: { width: 48, height: 48, borderRadius: 12, backgroundColor: COLORS.surfaceLight, alignItems: 'center', justifyContent: 'center', borderWidth: 1, borderColor: COLORS.primary },
   inputContainer: {
     flexDirection: 'row', alignItems: 'center',
     backgroundColor: COLORS.surface, borderRadius: 12, borderWidth: 1, borderColor: COLORS.border,

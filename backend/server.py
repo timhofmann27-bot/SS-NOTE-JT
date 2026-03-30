@@ -42,6 +42,81 @@ BCRYPT_ROUNDS = 12              # Erhöht von Default 10
 app = FastAPI(title="444.HEIMAT-FUNK API", docs_url=None, redoc_url=None)
 api_router = APIRouter(prefix="/api")
 
+# ==================== WEBSOCKET: Real-time messaging ====================
+import socketio
+
+sio = socketio.AsyncServer(async_mode='asgi', cors_allowed_origins='*', logger=False)
+
+# Mount Socket.IO onto FastAPI — works with server:app
+sio_asgi = socketio.ASGIApp(sio, socketio_path='/api/socket.io')
+app.mount('/api/socket.io', sio_asgi)
+
+# Map: user_id → set of socket sids
+connected_users: dict[str, set] = {}
+
+@sio.event
+async def connect(sid, environ, auth):
+    """Authenticate WebSocket connection via JWT token"""
+    token = auth.get('token') if auth else None
+    if not token:
+        raise socketio.exceptions.ConnectionRefusedError('No token')
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        if payload.get('type') != 'access':
+            raise socketio.exceptions.ConnectionRefusedError('Invalid token type')
+        user_id = payload['sub']
+        user = await db.users.find_one({"_id": ObjectId(user_id)})
+        if not user:
+            raise socketio.exceptions.ConnectionRefusedError('User not found')
+        # Store user_id in session
+        await sio.save_session(sid, {'user_id': user_id, 'username': user.get('username', '')})
+        # Track connected user
+        if user_id not in connected_users:
+            connected_users[user_id] = set()
+        connected_users[user_id].add(sid)
+        # Join user to their chat rooms
+        chats = await db.chats.find({"participant_ids": ObjectId(user_id)}).to_list(100)
+        for chat in chats:
+            await sio.enter_room(sid, f"chat:{str(chat['_id'])}")
+        # Update online status
+        await db.users.update_one({"_id": ObjectId(user_id)}, {"$set": {"status": "online", "last_seen": datetime.now(timezone.utc)}})
+        logger.info(f"WS connected: {user.get('username')} (sid={sid[:8]})")
+    except jwt.InvalidTokenError:
+        raise socketio.exceptions.ConnectionRefusedError('Invalid token')
+
+@sio.event
+async def disconnect(sid):
+    session = await sio.get_session(sid)
+    user_id = session.get('user_id') if session else None
+    if user_id:
+        connected_users.get(user_id, set()).discard(sid)
+        if not connected_users.get(user_id):
+            connected_users.pop(user_id, None)
+            await db.users.update_one({"_id": ObjectId(user_id)}, {"$set": {"status": "offline", "last_seen": datetime.now(timezone.utc)}})
+
+@sio.event
+async def typing(sid, data):
+    """Handle typing indicator via WebSocket"""
+    session = await sio.get_session(sid)
+    if not session:
+        return
+    chat_id = data.get('chat_id')
+    if chat_id:
+        await sio.emit('typing', {'user_id': session['user_id'], 'username': session.get('username', ''), 'chat_id': chat_id}, room=f"chat:{chat_id}", skip_sid=sid)
+
+async def ws_emit_to_chat(chat_id: str, event: str, data: dict, skip_user: str = None):
+    """Emit event to all connected users in a chat"""
+    skip_sids = connected_users.get(skip_user, set()) if skip_user else set()
+    for s in skip_sids:
+        pass  # We'll use room broadcast which is more efficient
+    await sio.emit(event, data, room=f"chat:{chat_id}")
+
+async def ws_emit_to_user(user_id: str, event: str, data: dict):
+    """Emit event to specific user's all connected devices"""
+    sids = connected_users.get(user_id, set())
+    for sid in sids:
+        await sio.emit(event, data, to=sid)
+
 # ==================== SECURITY MIDDLEWARE ====================
 
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
@@ -574,7 +649,12 @@ async def send_message(input: MessageSend, user: dict = Depends(get_current_user
     if input.is_emergency: preview = "NOTFALL: " + preview
     await db.chats.update_one({"_id": ObjectId(input.chat_id)}, {"$set": {"last_message": preview, "last_message_at": now}})
     msg_doc["_id"] = result.inserted_id
-    return {"message": serialize_message(msg_doc)}
+    serialized = serialize_message(msg_doc)
+    
+    # WebSocket: Push new message to all chat participants in realtime
+    await ws_emit_to_chat(input.chat_id, 'message:new', serialized)
+    
+    return {"message": serialized}
 
 @api_router.get("/messages/{chat_id}")
 async def get_messages(chat_id: str, limit: int = 50, before: Optional[str] = None, user: dict = Depends(get_current_user)):

@@ -1,5 +1,5 @@
 import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
-import { authAPI, setAuthToken } from '../utils/api';
+import { authAPI, setAuthToken, connectSocket, disconnectSocket } from '../utils/api';
 
 type User = {
   id: string;
@@ -34,7 +34,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   const refreshUser = useCallback(async () => {
     try { const res = await authAPI.me(); setUser(res.data.user); }
-    catch { setUser(null); setAuthToken(null); }
+    catch { setUser(null); setAuthToken(null); disconnectSocket(); }
   }, []);
 
   useEffect(() => {
@@ -49,16 +49,19 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     const res = await authAPI.login({ username, passkey });
     setAuthToken(res.data.token);
     setUser(res.data.user);
+    try { connectSocket(res.data.token); } catch {}
   };
 
   const register = async (username: string, passkey: string, name: string, callsign?: string) => {
     const res = await authAPI.register({ username, passkey, name, callsign });
     setAuthToken(res.data.token);
     setUser(res.data.user);
+    try { connectSocket(res.data.token); } catch {}
   };
 
   const logout = async () => {
     try { await authAPI.logout(); } catch {}
+    disconnectSocket();
     setAuthToken(null);
     setUser(null);
   };
