@@ -38,6 +38,11 @@ REFRESH_TOKEN_DAYS = 7          # 7 Tage statt 30
 
 FRONTEND_URL = os.environ.get('FRONTEND_URL', os.environ.get('EXPO_PUBLIC_BACKEND_URL', '*'))
 BCRYPT_ROUNDS = 12              # Erhöht von Default 10
+SECURE_COOKIES = os.environ.get('SECURE_COOKIES', 'false').lower() == 'true'
+
+def cookie_kwargs() -> dict:
+    """Return secure cookie settings — secure flag enabled in production"""
+    return {"httponly": True, "secure": SECURE_COOKIES, "samesite": "lax", "path": "/"}
 
 app = FastAPI(title="SS-Note API", docs_url=None, redoc_url=None)
 api_router = APIRouter(prefix="/api")
@@ -45,7 +50,7 @@ api_router = APIRouter(prefix="/api")
 # ==================== WEBSOCKET: Real-time messaging ====================
 import socketio
 
-sio = socketio.AsyncServer(async_mode='asgi', cors_allowed_origins='*', logger=False)
+sio = socketio.AsyncServer(async_mode='asgi', cors_allowed_origins=FRONTEND_URL.split(',') if FRONTEND_URL != '*' else [], logger=False)
 
 # Mount Socket.IO onto FastAPI — works with server:app
 sio_asgi = socketio.ASGIApp(sio, socketio_path='/api/socket.io')
@@ -153,19 +158,19 @@ def validate_object_id(oid: str) -> ObjectId:
     except (InvalidId, TypeError):
         raise HTTPException(status_code=400, detail="Ungültige ID")
 
-def anonymize_ip(ip: str) -> str:
-    """Hash IP for privacy — never store raw IPs"""
-    return hashlib.sha256(ip.encode()).hexdigest()[:16]
+AUDIT_LOG_TTL_DAYS = 30  # Audit logs auto-delete after 30 days
 
-async def audit_log(action: str, user_id: str = None, ip: str = None, details: dict = None):
-    """Security audit with anonymized IP (never stores raw IP)"""
-    await db.audit_log.insert_one({
+async def audit_log(action: str, user_id: str = None, details: dict = None):
+    """Security audit — no IP storage, with TTL auto-expiry"""
+    doc = {
         "action": action,
         "user_id": user_id,
-        "ip_hash": anonymize_ip(ip) if ip else None,  # ANONYMIZED — no raw IP
         "details": details or {},
         "timestamp": datetime.now(timezone.utc),
-    })
+    }
+    # Set TTL for auto-deletion
+    doc["expires_at"] = datetime.now(timezone.utc) + timedelta(days=AUDIT_LOG_TTL_DAYS)
+    await db.audit_log.insert_one(doc)
 
 # ==================== USERNAME GENERATOR ====================
 
@@ -453,10 +458,10 @@ async def register(input: RegisterInput, request: Request, response: Response):
     access_token = create_access_token(user_id)
     refresh_token = create_refresh_token(user_id)
     
-    response.set_cookie(key="access_token", value=access_token, httponly=True, secure=False, samesite="lax", max_age=ACCESS_TOKEN_MINUTES*60, path="/")
-    response.set_cookie(key="refresh_token", value=refresh_token, httponly=True, secure=False, samesite="lax", max_age=REFRESH_TOKEN_DAYS*86400, path="/")
-    
-    await audit_log("register", user_id, client_ip, {"username": username})
+    response.set_cookie(key="access_token", value=access_token, **cookie_kwargs(), max_age=ACCESS_TOKEN_MINUTES*60)
+    response.set_cookie(key="refresh_token", value=refresh_token, **cookie_kwargs(), max_age=REFRESH_TOKEN_DAYS*86400)
+
+    await audit_log("register", user_id, {"username": username})
     
     user_doc["id"] = user_id
     user_doc.pop("password_hash", None)
@@ -491,12 +496,12 @@ async def login(input: LoginInput, request: Request, response: Response):
     user = await db.users.find_one({"username": username})
     if not user:
         await _track_failed_login(identifier)
-        await audit_log("login_failed", None, client_ip, {"username": username})
+        await audit_log("login_failed", None, {"username": username})
         raise HTTPException(status_code=401, detail="Ungültige Anmeldedaten")
     
     if not verify_password(input.passkey, user["password_hash"]):
         await _track_failed_login(identifier)
-        await audit_log("login_failed", str(user["_id"]), client_ip, {"username": username})
+        await audit_log("login_failed", str(user["_id"]), {"username": username})
         raise HTTPException(status_code=401, detail="Ungültige Anmeldedaten")
     
     await db.login_attempts.delete_one({"identifier": identifier})
@@ -505,10 +510,10 @@ async def login(input: LoginInput, request: Request, response: Response):
     
     access_token = create_access_token(user_id)
     refresh_token = create_refresh_token(user_id)
-    response.set_cookie(key="access_token", value=access_token, httponly=True, secure=False, samesite="lax", max_age=ACCESS_TOKEN_MINUTES*60, path="/")
-    response.set_cookie(key="refresh_token", value=refresh_token, httponly=True, secure=False, samesite="lax", max_age=REFRESH_TOKEN_DAYS*86400, path="/")
-    
-    await audit_log("login_success", user_id, client_ip, {"username": username})
+    response.set_cookie(key="access_token", value=access_token, **cookie_kwargs(), max_age=ACCESS_TOKEN_MINUTES*60)
+    response.set_cookie(key="refresh_token", value=refresh_token, **cookie_kwargs(), max_age=REFRESH_TOKEN_DAYS*86400)
+
+    await audit_log("login_success", user_id, {"username": username})
     return {"user": serialize_user(user), "token": access_token}
 
 async def _track_failed_login(identifier: str):
@@ -537,7 +542,7 @@ async def logout(request: Request, response: Response, user: dict = Depends(get_
     await db.users.update_one({"_id": ObjectId(user["id"])}, {"$set": {"status": "offline", "last_seen": datetime.now(timezone.utc)}})
     response.delete_cookie("access_token", path="/")
     response.delete_cookie("refresh_token", path="/")
-    await audit_log("logout", user["id"], request.client.host if request.client else "unknown")
+    await audit_log("logout", user["id"])
     return {"message": "Abgemeldet"}
 
 @api_router.post("/auth/change-passkey")
@@ -548,7 +553,7 @@ async def change_passkey(input: PasskeyChange, request: Request, user: dict = De
     if not verify_password(input.old_passkey, full_user["password_hash"]):
         raise HTTPException(status_code=400, detail="Alter Passkey ist falsch")
     await db.users.update_one({"_id": ObjectId(user["id"])}, {"$set": {"password_hash": hash_password(input.new_passkey)}})
-    await audit_log("passkey_change", user["id"], request.client.host if request.client else "unknown")
+    await audit_log("passkey_change", user["id"])
     return {"message": "Passkey geändert"}
 
 # ==================== ADD-ME CODE GENERATOR ====================
@@ -594,7 +599,7 @@ async def reset_add_code(request: Request, user: dict = Depends(get_current_user
         raise HTTPException(status_code=429, detail="Maximal 3 Code-Resets pro Tag")
     new_code = generate_add_code()
     await db.users.update_one({"_id": ObjectId(user["id"])}, {"$set": {"add_me_code": new_code, "add_me_code_updated_at": datetime.now(timezone.utc)}})
-    await audit_log("add_code_reset", user["id"], client_ip)
+    await audit_log("add_code_reset", user["id"])
     return {"code": new_code}
 
 # PRIVACY: Remove global user listing — only confirmed contacts visible
@@ -633,7 +638,7 @@ async def add_by_code(input: AddByCodeInput, request: Request, user: dict = Depe
     
     # Rate limit: 5 code attempts/min (disabled in testing mode)
     if not TESTING:
-        rl_key = f"addcode:{anonymize_ip(client_ip)}"
+        rl_key = f"addcode:{user['id']}"
         rl = await db.login_attempts.find_one_and_update(
             {"identifier": rl_key},
             {"$inc": {"count": 1}, "$set": {"last_attempt": datetime.now(timezone.utc)}, "$setOnInsert": {"locked_until": None}},
@@ -689,7 +694,7 @@ async def add_by_code(input: AddByCodeInput, request: Request, user: dict = Depe
         "from_name": user.get("name", ""),
     })
     
-    await audit_log("contact_request_sent", user["id"], client_ip, {"target_id": target_id})
+    await audit_log("contact_request_sent", user["id"], {"target_id": target_id})
     return {"message": "Anfrage gesendet!", "request_id": str(result.inserted_id)}
 
 @api_router.get("/contacts/requests")
@@ -740,7 +745,7 @@ async def accept_contact_request(request_id: str, request: Request, user: dict =
     })
     
     client_ip = request.client.host if request.client else "unknown"
-    await audit_log("contact_accepted", user["id"], client_ip, {"requester_id": requester_id})
+    await audit_log("contact_accepted", user["id"], {"requester_id": requester_id})
     return {"message": "Kontakt bestätigt!"}
 
 @api_router.post("/contacts/request/{request_id}/reject")
@@ -772,7 +777,7 @@ async def remove_contact(contact_id: str, request: Request, user: dict = Depends
     # WebSocket: Notify other user
     await ws_emit_to_user(contact_id, "contact:removed", {"by_user_id": user["id"]})
     client_ip = request.client.host if request.client else "unknown"
-    await audit_log("contact_removed", user["id"], client_ip, {"contact_id": contact_id})
+    await audit_log("contact_removed", user["id"], {"contact_id": contact_id})
     return {"message": "Kontakt entfernt"}
 
 # ==================== CHATS ====================
@@ -1080,7 +1085,7 @@ async def delete_message(message_id: str, request: Request, user: dict = Depends
         await ws_emit_to_chat(msg["chat_id"], 'message:deleted', {'message_id': message_id, 'chat_id': msg["chat_id"]})
     else:
         await db.messages.update_one({"_id": oid}, {"$set": {"content": "[Nachricht gelöscht]", "deleted": True}})
-    await audit_log("message_deleted", user["id"], request.client.host if request.client else "unknown")
+    await audit_log("message_deleted", user["id"])
     return {"message": "Nachricht gelöscht"}
 
 class MessageEdit(BaseModel):
@@ -1228,8 +1233,8 @@ async def refresh_token(request: Request, response: Response):
         # Blacklist old refresh token
         old_hash = hashlib.sha256(token.encode()).hexdigest()
         await db.token_blacklist.insert_one({"token_hash": old_hash, "user_id": user_id, "blacklisted_at": datetime.now(timezone.utc), "expires_at": datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_DAYS)})
-        response.set_cookie(key="access_token", value=new_access, httponly=True, secure=False, samesite="lax", max_age=ACCESS_TOKEN_MINUTES*60, path="/")
-        response.set_cookie(key="refresh_token", value=new_refresh, httponly=True, secure=False, samesite="lax", max_age=REFRESH_TOKEN_DAYS*86400, path="/")
+        response.set_cookie(key="access_token", value=new_access, **cookie_kwargs(), max_age=ACCESS_TOKEN_MINUTES*60)
+        response.set_cookie(key="refresh_token", value=new_refresh, **cookie_kwargs(), max_age=REFRESH_TOKEN_DAYS*86400)
         return {"token": new_access, "user": serialize_user(user)}
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Refresh-Token abgelaufen")
@@ -1254,7 +1259,7 @@ async def delete_account(request: Request, response: Response, user: dict = Depe
     response.delete_cookie("access_token", path="/")
     response.delete_cookie("refresh_token", path="/")
     client_ip = request.client.host if request.client else "unknown"
-    await audit_log("account_deleted", uid, client_ip)
+    await audit_log("account_deleted", uid)
     return {"message": "Account und alle Daten gelöscht"}
 
 # ==================== QR MAGIC LINKS (Device-to-Device) ====================
@@ -1286,7 +1291,7 @@ async def create_magic_qr(request: Request, user: dict = Depends(get_current_use
     img.save(buf, format='PNG')
     qr_base64 = base64.b64encode(buf.getvalue()).decode('utf-8')
     
-    await audit_log("magic_qr_created", user["id"], request.client.host if request.client else "unknown")
+    await audit_log("magic_qr_created", user["id"])
     return {"qr_base64": f"data:image/png;base64,{qr_base64}", "token": magic_token, "expires_in": 300}
 
 @api_router.post("/auth/magic-verify")
@@ -1319,11 +1324,11 @@ async def verify_magic_token(request: Request, response: Response):
     
     access_token = create_access_token(user_id)
     refresh_token = create_refresh_token(user_id)
-    response.set_cookie(key="access_token", value=access_token, httponly=True, secure=False, samesite="lax", max_age=ACCESS_TOKEN_MINUTES*60, path="/")
-    response.set_cookie(key="refresh_token", value=refresh_token, httponly=True, secure=False, samesite="lax", max_age=REFRESH_TOKEN_DAYS*86400, path="/")
+    response.set_cookie(key="access_token", value=access_token, **cookie_kwargs(), max_age=ACCESS_TOKEN_MINUTES*60)
+    response.set_cookie(key="refresh_token", value=refresh_token, **cookie_kwargs(), max_age=REFRESH_TOKEN_DAYS*86400)
     
     client_ip = request.client.host if request.client else "unknown"
-    await audit_log("magic_login", user_id, client_ip, {"via": "qr_scan"})
+    await audit_log("magic_login", user_id, {"via": "qr_scan"})
     return {"user": serialize_user(user), "token": access_token}
 
 # Socket.IO: Notify original device when QR is scanned
@@ -1356,7 +1361,7 @@ async def upload_public_key(input: PublicKeyUpload, request: Request, user: dict
         }},
         upsert=True
     )
-    await audit_log("key_uploaded", user["id"], request.client.host if request.client else "unknown")
+    await audit_log("key_uploaded", user["id"])
     return {"message": "Public key gespeichert"}
 
 @api_router.get("/keys/{user_id}")
@@ -1400,14 +1405,14 @@ async def register_push_token(input: PushTokenUpload, request: Request, user: di
         }},
         upsert=True
     )
-    await audit_log("push_registered", user["id"], request.client.host if request.client else "unknown", {"platform": input.platform})
+    await audit_log("push_registered", user["id"], {"platform": input.platform})
     return {"message": "Push-Token registriert"}
 
 @api_router.delete("/push/unregister")
 async def unregister_push_token(request: Request, user: dict = Depends(get_current_user)):
     """Remove push token for current device"""
     await db.push_tokens.delete_many({"user_id": user["id"]})
-    await audit_log("push_unregistered", user["id"], request.client.host if request.client else "unknown")
+    await audit_log("push_unregistered", user["id"])
     return {"message": "Push-Token entfernt"}
 
 async def send_push_notification(user_id: str, chat_name: str = None):
@@ -1523,6 +1528,7 @@ async def startup():
     await db.token_blacklist.create_index("token_hash")
     await db.token_blacklist.create_index("expires_at", expireAfterSeconds=0)
     await db.audit_log.create_index("timestamp")
+    await db.audit_log.create_index("expires_at", expireAfterSeconds=0)  # TTL: auto-delete after 30 days
     await db.magic_tokens.create_index("token")
     await db.magic_tokens.create_index("expires_at", expireAfterSeconds=0)
     await db.user_keys.create_index("user_id", unique=True)

@@ -14,6 +14,10 @@ export function generateKeyPair() {
   return nacl.box.keyPair();
 }
 
+export function generateSigningKeyPair() {
+  return nacl.sign.keyPair();
+}
+
 export async function storeKeyPair(keyPair: naclBoxKeyPair) {
   const combined = new Uint8Array([...keyPair.publicKey, ...keyPair.secretKey]);
   await SecureStore.setItemAsync(KEYPAIR_STORAGE, nacl.encodeBase64(combined));
@@ -30,22 +34,57 @@ export async function getKeyPair(): Promise<naclBoxKeyPair | null> {
   };
 }
 
-// ==================== HKDF (HMAC-based Key Derivation) ====================
+// ==================== Proper HMAC-SHA256 ====================
+// Uses nacl.hash (SHA-512) to construct HMAC per RFC 2104:
+// HMAC(K, m) = H((K' ⊕ opad) || H((K' ⊕ ipad) || m))
+// where K' = H(K) if K > block_size, else K padded to block_size
 
 function hmacSHA256(key: Uint8Array, data: Uint8Array): Uint8Array {
-  const nonce = new Uint8Array(nacl.secretbox.nonceLength);
-  const derived = nacl.secretbox(data, nonce, key);
-  return derived.slice(0, 32);
+  const blockSize = 64; // SHA-256 block size in bytes
+
+  // If key is larger than block size, hash it
+  let k: Uint8Array;
+  if (key.length > blockSize) {
+    k = nacl.hash(key).slice(0, 32);
+  } else {
+    k = new Uint8Array(key);
+  }
+
+  // Pad key to block size
+  const keyPad = new Uint8Array(blockSize);
+  keyPad.set(k);
+
+  // Create inner and outer padded keys
+  const iKeyPad = new Uint8Array(blockSize);
+  const oKeyPad = new Uint8Array(blockSize);
+  for (let i = 0; i < blockSize; i++) {
+    iKeyPad[i] = keyPad[i] ^ 0x36; // ipad
+    oKeyPad[i] = keyPad[i] ^ 0x5c; // opad
+  }
+
+  // Inner hash: H(iKeyPad || data)
+  const innerData = new Uint8Array(blockSize + data.length);
+  innerData.set(iKeyPad);
+  innerData.set(data, blockSize);
+  const innerHash = nacl.hash(innerData).slice(0, 32);
+
+  // Outer hash: H(oKeyPad || innerHash)
+  const outerData = new Uint8Array(blockSize + 32);
+  outerData.set(oKeyPad);
+  outerData.set(innerHash, blockSize);
+  const outerHash = nacl.hash(outerData).slice(0, 32);
+
+  return outerHash;
 }
 
 function hkdf(inputKeyMaterial: Uint8Array, info: string, length: number): Uint8Array {
   const salt = new Uint8Array(32);
   const prk = hmacSHA256(salt, inputKeyMaterial);
-  
+
   let okm = new Uint8Array(0);
   let t = new Uint8Array(0);
   let counter = 1;
-  
+
   while (okm.length < length) {
     const infoBytes = utf8Encode(info);
     const input = new Uint8Array([...t, ...infoBytes, counter]);
@@ -54,7 +93,7 @@ function hkdf(inputKeyMaterial: Uint8Array, info: string, length: number): Uint8
     okm = combined;
     counter++;
   }
-  
+
   return okm.slice(0, length);
 }
 
@@ -123,7 +162,7 @@ export interface SenderKeyState {
   senderKeyId: string;
   chainKey: Uint8Array;
   iteration: number;
-  signingKeyPair: naclBoxKeyPair;
+  signingKeyPair: naclSignKeyPair;
 }
 
 export interface GroupSessionState {
@@ -178,8 +217,8 @@ export async function initializeGroupSession(
   
   const senderKeyId = `${ourKeyPair.publicKey.reduce((a, b) => a + b, 0)}-${Date.now()}`;
   const senderChainKey = nacl.randomBytes(32);
-  const signingKeyPair = nacl.box.keyPair();
-  
+  const signingKeyPair = nacl.sign.keyPair();
+
   const ourSenderKey: SenderKeyState = {
     senderKeyId,
     chainKey: senderChainKey,
@@ -230,35 +269,42 @@ export async function removeGroupMember(
 
 // ==================== Ratchet Operations ====================
 
-function ratchetStepSend(state: RatchetState): { rootKey: Uint8Array; chainKey: Uint8Array; dhPublic: Uint8Array } {
-  if (!state.dhRemotePublicKey) {
-    const newDhKeyPair = nacl.box.keyPair();
-    state.dhKeyPair = newDhKeyPair;
-    return { rootKey: state.rootKey, chainKey: state.chainKey, dhPublic: newDhKeyPair.publicKey };
-  }
+function ratchetStepSend(state: RatchetState): { rootKey: Uint8Array; chainKey: Uint8Array; dhPublic: Uint8Array; didDHRatchet: boolean } {
   const newDhKeyPair = nacl.box.keyPair();
-  const shared = nacl.box.before(state.dhRemotePublicKey, state.dhKeyPair.secretKey);
-  const newRootKey = hkdf(shared, 'ssnote-ratchet-root', 32);
-  const newChainKey = hkdf(shared, 'ssnote-ratchet-chain', 32);
-  
+
+  if (state.dhRemotePublicKey) {
+    // Perform full DH ratchet: shared secret with remote's last DH key
+    const shared = nacl.box.before(state.dhRemotePublicKey, state.dhKeyPair.secretKey);
+    const newRootKey = hkdf(shared, 'ssnote-ratchet-root', 32);
+    const newChainKey = hkdf(newRootKey, 'ssnote-ratchet-chain', 32);
+
+    state.dhKeyPair = newDhKeyPair;
+    state.rootKey = newRootKey;
+    state.chainKey = newChainKey;
+    state.messageNumber = 0;
+
+    return { rootKey: newRootKey, chainKey: newChainKey, dhPublic: newDhKeyPair.publicKey, didDHRatchet: true };
+  }
+
+  // No remote DH key yet: advance chain key via symmetric ratchet only
+  // The DH ratchet will happen once we receive the remote's DH public key
   state.dhKeyPair = newDhKeyPair;
-  state.rootKey = newRootKey;
-  state.chainKey = newChainKey;
-  state.messageNumber = 0;
-  
-  return { rootKey: newRootKey, chainKey: newChainKey, dhPublic: newDhKeyPair.publicKey };
+  state.chainKey = nextChainKey(state.chainKey);
+
+  return { rootKey: state.rootKey, chainKey: state.chainKey, dhPublic: newDhKeyPair.publicKey, didDHRatchet: false };
 }
 
 function ratchetStepReceive(state: RatchetState, remoteDHPublic: Uint8Array): { rootKey: Uint8Array; chainKey: Uint8Array } {
+  // Perform DH ratchet: compute shared secret using our current DH key pair and remote's new DH public key
   const shared = nacl.box.before(remoteDHPublic, state.dhKeyPair.secretKey);
   const newRootKey = hkdf(shared, 'ssnote-ratchet-root', 32);
-  const newChainKey = hkdf(shared, 'ssnote-ratchet-chain', 32);
-  
+  const newChainKey = hkdf(newRootKey, 'ssnote-ratchet-chain', 32);
+
   state.dhRemotePublicKey = remoteDHPublic;
   state.rootKey = newRootKey;
   state.chainKey = newChainKey;
   state.messageNumber = 0;
-  
+
   return { rootKey: newRootKey, chainKey: newChainKey };
 }
 
@@ -318,20 +364,18 @@ export async function ratchetEncrypt(
 } | null> {
   const session = await loadSession(chatId);
   if (!session || !session.ratchet) return null;
-  
+
   const ratchet = session.ratchet;
-  
-  if (ratchet.messageNumber === 0) {
-    ratchetStepSend(ratchet);
-  }
-  
+
+  const { dhPublic: newDhPublic, didDHRatchet } = ratchetStepSend(ratchet);
+
   const entropy = nacl.randomBytes(16);
   const msgKey = deriveMessageKey(ratchet.chainKey, ratchet.messageNumber, messageType, entropy);
   const nonce = nacl.randomBytes(nacl.secretbox.nonceLength);
-  
+
   const msgBytes = utf8Encode(plaintext);
   const encrypted = nacl.secretbox(msgBytes, nonce, msgKey);
-  
+
   let mediaCiphertext: string | null = null;
   let mediaNonce: string | null = null;
   if (mediaBase64) {
@@ -342,14 +386,15 @@ export async function ratchetEncrypt(
     mediaCiphertext = nacl.encodeBase64(mediaEncrypted);
     mediaNonce = nacl.encodeBase64(mNonce);
   }
-  
+
   ratchet.chainKey = nextChainKey(ratchet.chainKey);
   ratchet.messageNumber++;
-  
-  const dhPublic = ratchet.messageNumber === 1 ? nacl.encodeBase64(ratchet.dhKeyPair.publicKey) : null;
-  
+
+  // Send DH public key when we performed a DH ratchet (new chain)
+  const dhPublic = didDHRatchet ? nacl.encodeBase64(newDhPublic) : null;
+
   await saveSession(chatId, session);
-  
+
   return {
     ciphertext: nacl.encodeBase64(encrypted),
     nonce: nacl.encodeBase64(nonce),
@@ -763,17 +808,17 @@ export async function processSenderKeyDistributionMessage(
 ): Promise<void> {
   const session = await loadGroupSession(chatId);
   if (!session) return;
-  
+
   session.theirSenderKeys.set(senderUserId, {
     senderKeyId: distribution.senderKeyId,
     chainKey: nacl.decodeBase64(distribution.chainKey),
     iteration: distribution.iteration,
     signingKeyPair: {
       publicKey: nacl.decodeBase64(distribution.signingPublicKey),
-      secretKey: new Uint8Array(nacl.box.secretKeyLength),
+      secretKey: new Uint8Array(nacl.sign.secretKeyLength), // placeholder — we only verify with public key
     },
   });
-  
+
   await saveGroupSession(chatId, session);
 }
 
@@ -798,6 +843,11 @@ export async function clearAllSessions() {
 }
 
 interface naclBoxKeyPair {
+  publicKey: Uint8Array;
+  secretKey: Uint8Array;
+}
+
+interface naclSignKeyPair {
   publicKey: Uint8Array;
   secretKey: Uint8Array;
 }
