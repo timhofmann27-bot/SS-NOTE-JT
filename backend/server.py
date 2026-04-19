@@ -334,6 +334,11 @@ class PollCreate(BaseModel):
 class PollVote(BaseModel):
     option_index: int = Field(ge=0, le=9)
 
+class StatusUpdate(BaseModel):
+    content: str = Field(min_length=1, max_length=1000)
+    media_base64: Optional[str] = None
+    visibility: str = "contacts"
+
 # ==================== HELPERS ====================
 
 def hash_password(password: str) -> str:
@@ -1902,6 +1907,93 @@ async def send_pairwise_encrypted_message(input: PairwiseEncryptedMessageSend, u
 
     return {"message": serialized}
 
+# ==================== STATUS / STORIES ====================
+
+@api_router.post("/status")
+async def create_status_update(input: StatusUpdate, request: Request, user: dict = Depends(get_current_user)):
+    """Create an ephemeral status update (auto-deletes after 24h)"""
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(hours=24)
+
+    status_doc = {
+        "user_id": user["id"],
+        "username": user.get("username", ""),
+        "name": user.get("name", ""),
+        "content": input.content,
+        "media_base64": input.media_base64,
+        "visibility": input.visibility,
+        "created_at": now,
+        "expires_at": expires_at,
+    }
+    result = await db.status_updates.insert_one(status_doc)
+
+    contacts = await db.contacts.find({"owner_id": user["id"], "status": "confirmed"}).to_list(500)
+    for c in contacts:
+        await ws_emit_to_user(c["contact_id"], 'status:new', {
+            "user_id": user["id"],
+            "username": user.get("username", ""),
+            "name": user.get("name", ""),
+            "status_id": str(result.inserted_id),
+        })
+
+    return {"message": "Status aktualisiert", "status_id": str(result.inserted_id), "expires_at": expires_at.isoformat()}
+
+@api_router.get("/status")
+async def get_status_updates(user: dict = Depends(get_current_user)):
+    """Get status updates from contacts (only non-expired)"""
+    now = datetime.now(timezone.utc)
+    contacts = await db.contacts.find({"owner_id": user["id"], "status": "confirmed"}).to_list(500)
+    contact_ids = [c["contact_id"] for c in contacts]
+
+    statuses = await db.status_updates.find({
+        "user_id": {"$in": contact_ids},
+        "expires_at": {"$gt": now},
+    }).sort("created_at", -1).to_list(200)
+
+    grouped = {}
+    for s in statuses:
+        uid = s["user_id"]
+        if uid not in grouped:
+            grouped[uid] = {
+                "user_id": uid,
+                "username": s.get("username", ""),
+                "name": s.get("name", ""),
+                "statuses": [],
+            }
+        grouped[uid]["statuses"].append({
+            "id": str(s["_id"]),
+            "content": s["content"],
+            "has_media": bool(s.get("media_base64")),
+            "created_at": s["created_at"].isoformat(),
+            "expires_at": s["expires_at"].isoformat(),
+        })
+
+    return {"statuses": list(grouped.values())}
+
+@api_router.get("/status/my")
+async def get_my_status_updates(user: dict = Depends(get_current_user)):
+    """Get own status updates"""
+    now = datetime.now(timezone.utc)
+    statuses = await db.status_updates.find({
+        "user_id": user["id"],
+        "expires_at": {"$gt": now},
+    }).sort("created_at", -1).to_list(50)
+
+    return {"statuses": [{
+        "id": str(s["_id"]),
+        "content": s["content"],
+        "has_media": bool(s.get("media_base64")),
+        "created_at": s["created_at"].isoformat(),
+        "expires_at": s["expires_at"].isoformat(),
+    } for s in statuses]}
+
+@api_router.delete("/status/{status_id}")
+async def delete_status_update(status_id: str, request: Request, user: dict = Depends(get_current_user)):
+    """Delete own status update"""
+    oid = validate_object_id(status_id)
+    await db.status_updates.delete_one({"_id": oid, "user_id": user["id"]})
+    return {"message": "Status gelöscht"}
+
 # ==================== STARTUP ====================
 
 @app.on_event("startup")
@@ -1927,6 +2019,8 @@ async def startup():
     await db.magic_tokens.create_index("expires_at", expireAfterSeconds=0)
     await db.user_keys.create_index("user_id", unique=True)
     await db.push_tokens.create_index([("user_id", 1), ("platform", 1)])
+    await db.status_updates.create_index("expires_at", expireAfterSeconds=0)  # TTL: auto-delete after 24h
+    await db.status_updates.create_index([("user_id", 1), ("created_at", -1)])
     
     # Seed anonymous demo users
     for udata in [

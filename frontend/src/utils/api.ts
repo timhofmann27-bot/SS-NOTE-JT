@@ -148,6 +148,14 @@ export const pushAPI = {
   unregister: () => api.delete('/push/unregister'),
 };
 
+export const statusAPI = {
+  create: (content: string, mediaBase64?: string | null) =>
+    api.post('/status', { content, media_base64: mediaBase64 }),
+  get: () => api.get('/status'),
+  getMy: () => api.get('/status/my'),
+  delete: (id: string) => api.delete(`/status/${id}`),
+};
+
 export const encryptedMessagesAPI = {
   send: (data: {
     chat_id: string;
