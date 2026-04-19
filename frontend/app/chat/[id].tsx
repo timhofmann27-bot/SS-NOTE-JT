@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   View, Text, TextInput, TouchableOpacity, StyleSheet, FlatList,
-  KeyboardAvoidingView, Platform, ActivityIndicator, Modal, ScrollView, Alert
+  KeyboardAvoidingView, Platform, ActivityIndicator, Modal, ScrollView, Alert, PanResponder
 } from 'react-native';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import { SafeAreaView } from 'react-native-safe-area-context';
@@ -21,6 +21,8 @@ import {
   ratchetDecrypt,
   sharedSecret,
 } from '../../src/utils/crypto';
+import VoiceRecorder from '../../src/components/VoiceRecorder';
+import VoiceMessagePlayer from '../../src/components/VoiceMessagePlayer';
 import nacl from 'tweetnacl';
 
 export default function ChatDetailScreen() {
@@ -42,6 +44,7 @@ export default function ChatDetailScreen() {
   const [isE2EESessionActive, setIsE2EESessionActive] = useState(false);
   const [e2eeFingerprint, setE2eeFingerprint] = useState<string | null>(null);
   const [showFingerprint, setShowFingerprint] = useState(false);
+  const [isRecordingVoice, setIsRecordingVoice] = useState(false);
   const flatListRef = useRef<FlatList>(null);
   const typingTimer = useRef<any>(null);
   const lastMsgId = useRef<string | null>(null);
@@ -294,6 +297,76 @@ export default function ChatDetailScreen() {
     }
   };
 
+  const handleVoiceSend = async (audioBase64: string, durationMs: number) => {
+    if (!id) return;
+    setSending(true);
+    setIsRecordingVoice(false);
+    try {
+      if (e2eeSessionRef.current) {
+        if (chat?.is_group) {
+          const encrypted = await groupEncrypt(`🎤 Sprachnachricht (${Math.floor(durationMs / 1000)}s)`, id, 'voice', audioBase64);
+          if (encrypted) {
+            const res = await encryptedMessagesAPI.send({
+              chat_id: id,
+              ciphertext: encrypted.ciphertext,
+              nonce: encrypted.nonce,
+              sender_key_id: encrypted.senderKeyId,
+              sender_key_iteration: encrypted.iteration,
+              message_type: 'voice',
+              media_ciphertext: encrypted.mediaCiphertext,
+              media_nonce: encrypted.mediaNonce,
+              security_level: securityLevel,
+              self_destruct_seconds: selfDestruct,
+            });
+            const msg = res.data.message;
+            msg.content = `🎤 Sprachnachricht (${Math.floor(durationMs / 1000)}s)`;
+            msg.media_base64 = audioBase64;
+            msg._e2ee_sent = true;
+            setMessages(prev => [...prev, msg]);
+            lastMsgId.current = msg.id;
+          }
+        } else {
+          const encrypted = await ratchetEncrypt(`🎤 Sprachnachricht (${Math.floor(durationMs / 1000)}s)`, id, 'voice', audioBase64);
+          if (encrypted) {
+            const res = await encryptedMessagesAPI.send({
+              chat_id: id,
+              ciphertext: encrypted.ciphertext,
+              nonce: encrypted.nonce,
+              dh_public: encrypted.dhPublic,
+              msg_num: encrypted.msgNum,
+              message_type: 'voice',
+              media_ciphertext: encrypted.mediaCiphertext,
+              media_nonce: encrypted.mediaNonce,
+              security_level: securityLevel,
+              self_destruct_seconds: selfDestruct,
+            });
+            const msg = res.data.message;
+            msg.content = `🎤 Sprachnachricht (${Math.floor(durationMs / 1000)}s)`;
+            msg.media_base64 = audioBase64;
+            msg._e2ee_sent = true;
+            setMessages(prev => [...prev, msg]);
+            lastMsgId.current = msg.id;
+          }
+        }
+      } else {
+        const res = await messagesAPI.send({
+          chat_id: id,
+          content: `🎤 Sprachnachricht (${Math.floor(durationMs / 1000)}s)`,
+          message_type: 'voice',
+          media_base64: audioBase64,
+          security_level: securityLevel,
+          self_destruct_seconds: selfDestruct,
+        });
+        setMessages(prev => [...prev, res.data.message]);
+        lastMsgId.current = res.data.message.id;
+      }
+    } catch (e) {
+      console.log('Error sending voice message', e);
+    } finally {
+      setSending(false);
+    }
+  };
+
   const handleTyping = () => {
     if (!id) return;
     if (typingTimer.current) clearTimeout(typingTimer.current);
@@ -418,10 +491,12 @@ export default function ChatDetailScreen() {
 
     const getMediaLabel = (msg: any) => {
       if (msg.message_type === 'image') return 'Verschlüsseltes Bild';
-      if (msg.message_type === 'voice') return 'Verschlüsselte Audio';
+      if (msg.message_type === 'voice') return 'Sprachnachricht';
       if (msg.message_type === 'file') return 'Verschlüsselte Datei';
       return 'Verschlüsseltes Medium';
     };
+
+    const isVoiceMessage = item.message_type === 'voice';
 
     return (
       <View>
@@ -464,7 +539,13 @@ export default function ChatDetailScreen() {
                 <Text style={[styles.msgSecText, { color: getSecColor(item.security_level) }]}>{item.security_level}</Text>
               </View>
             )}
-            {hasMedia && (
+            {isVoiceMessage && item.media_base64 ? (
+              <VoiceMessagePlayer
+                audioBase64={item.media_base64}
+                durationMs={parseInt(item.content?.match(/\((\d+)s\)/)?.[1] || '0') * 1000 || 0}
+                isMine={isMine}
+              />
+            ) : hasMedia ? (
               <View style={styles.mediaContainer}>
                 <Ionicons name={getMediaIcon(item)} size={24} color={COLORS.primaryLight} />
                 <Text style={styles.mediaLabel}>{getMediaLabel(item)}</Text>
@@ -474,8 +555,8 @@ export default function ChatDetailScreen() {
                   </View>
                 )}
               </View>
-            )}
-            <Text style={styles.msgContent}>{item.content}</Text>
+            ) : null}
+            {!isVoiceMessage && <Text style={styles.msgContent}>{item.content}</Text>}
             <View style={styles.msgFooter}>
               {item.e2ee && <Ionicons name="lock-closed" size={9} color="#4CAF50" />}
               {item.encrypted && !item.e2ee && <Ionicons name="lock-closed" size={9} color={COLORS.textMuted} />}
@@ -595,35 +676,52 @@ export default function ChatDetailScreen() {
         )}
 
         {/* Input */}
-        <View style={styles.inputBar}>
-          <TouchableOpacity testID="security-menu-btn" onPress={() => setShowSecMenu(!showSecMenu)} style={styles.secBtn}>
-            <Ionicons name="shield" size={20} color={getSecColor(securityLevel)} />
-          </TouchableOpacity>
-          <View style={styles.inputContainer}>
-            <TextInput
-              testID="message-input"
-              style={styles.input}
-              value={text}
-              onChangeText={(t) => { setText(t); handleTyping(); }}
-              placeholder="Nachricht schreiben..."
-              placeholderTextColor={COLORS.textMuted}
-              multiline
-              maxLength={4000}
-            />
-          </View>
-          <TouchableOpacity
-            testID="send-message-btn"
-            style={[styles.sendBtn, (!text.trim() || sending) && styles.sendBtnDisabled]}
-            onPress={handleSend}
-            disabled={!text.trim() || sending}
-          >
-            {sending ? (
-              <ActivityIndicator size="small" color={COLORS.white} />
+        {isRecordingVoice ? (
+          <VoiceRecorder
+            onSend={handleVoiceSend}
+            onCancel={() => setIsRecordingVoice(false)}
+          />
+        ) : (
+          <View style={styles.inputBar}>
+            <TouchableOpacity testID="security-menu-btn" onPress={() => setShowSecMenu(!showSecMenu)} style={styles.secBtn}>
+              <Ionicons name="shield" size={20} color={getSecColor(securityLevel)} />
+            </TouchableOpacity>
+            <View style={styles.inputContainer}>
+              <TextInput
+                testID="message-input"
+                style={styles.input}
+                value={text}
+                onChangeText={(t) => { setText(t); handleTyping(); }}
+                placeholder="Nachricht schreiben..."
+                placeholderTextColor={COLORS.textMuted}
+                multiline
+                maxLength={4000}
+              />
+            </View>
+            {text.trim() ? (
+              <TouchableOpacity
+                testID="send-message-btn"
+                style={[styles.sendBtn, sending && styles.sendBtnDisabled]}
+                onPress={handleSend}
+                disabled={sending}
+              >
+                {sending ? (
+                  <ActivityIndicator size="small" color={COLORS.white} />
+                ) : (
+                  <Ionicons name="send" size={18} color={COLORS.white} />
+                )}
+              </TouchableOpacity>
             ) : (
-              <Ionicons name="send" size={18} color={COLORS.white} />
+              <TouchableOpacity
+                testID="voice-record-btn"
+                style={styles.micBtn}
+                onPress={() => setIsRecordingVoice(true)}
+              >
+                <Ionicons name="mic" size={20} color={COLORS.white} />
+              </TouchableOpacity>
             )}
-          </TouchableOpacity>
-        </View>
+          </View>
+        )}
       </KeyboardAvoidingView>
 
       {/* Group Info Modal */}
@@ -896,4 +994,10 @@ const styles = StyleSheet.create({
   mediaLabel: { fontSize: FONTS.sizes.xs, color: COLORS.primaryLight, marginTop: 6, fontWeight: FONTS.weights.medium },
   mediaPreview: { marginTop: 8, padding: 8, backgroundColor: COLORS.surfaceLight, borderRadius: 8 },
   mediaPreviewText: { fontSize: FONTS.sizes.xs, color: COLORS.textMuted },
+
+  // Voice
+  micBtn: {
+    width: 40, height: 40, borderRadius: 20, backgroundColor: COLORS.primary,
+    alignItems: 'center', justifyContent: 'center', marginLeft: 6,
+  },
 });
