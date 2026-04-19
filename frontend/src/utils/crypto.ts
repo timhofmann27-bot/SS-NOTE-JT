@@ -889,6 +889,78 @@ export async function ratchetDecrypt(
   };
 }
 
+// ==================== Group Pairwise E2EE (Threema-style) ====================
+// Threema Pattern: Jede Nachricht wird individuell für jeden Empfänger verschlüsselt
+// - Stärkere Sicherheit als Sender Keys (kein Single-Point-of-Failure)
+// - Forward Secrecy pro Empfänger-Paar
+// - Wenn ein Empfänger-Key kompromittiert wird, sind nur dessen Nachrichten lesbar
+
+export interface PairwiseEncryptedMessage {
+  recipientId: string;
+  ciphertext: string;
+  nonce: string;
+  dhPublic: string | null;
+  msgNum: number;
+  mediaCiphertext?: string | null;
+  mediaNonce?: string | null;
+}
+
+export async function groupPairwiseEncrypt(
+  plaintext: string,
+  chatId: string,
+  memberIds: string[],
+  messageType: string = 'text',
+  mediaBase64?: string | null
+): Promise<PairwiseEncryptedMessage[]> {
+  const results: PairwiseEncryptedMessage[] = [];
+
+  for (const memberId of memberIds) {
+    // Encrypt individually for each member using their 1:1 session
+    const session = await loadSession(`${chatId}-${memberId}`);
+    if (!session || !session.ratchet) continue;
+
+    const ratchet = session.ratchet;
+    const { dhPublic: newDhPublic, didDHRatchet } = ratchetStepSend(ratchet);
+
+    const entropy = nacl.randomBytes(16);
+    const msgKey = deriveMessageKey(ratchet.chainKey, ratchet.messageNumber, messageType, entropy);
+    const nonce = nacl.randomBytes(nacl.secretbox.nonceLength);
+
+    const msgBytes = utf8Encode(plaintext);
+    const encrypted = nacl.secretbox(msgBytes, nonce, msgKey);
+
+    let mediaCiphertext: string | null = null;
+    let mediaNonce: string | null = null;
+    if (mediaBase64) {
+      const mKey = deriveMediaKey(msgKey, 'media');
+      const mNonce = nacl.randomBytes(nacl.secretbox.nonceLength);
+      const mediaBytes = nacl.decodeBase64(mediaBase64);
+      const mediaEncrypted = nacl.secretbox(mediaBytes, mNonce, mKey);
+      mediaCiphertext = nacl.encodeBase64(mediaEncrypted);
+      mediaNonce = nacl.encodeBase64(mNonce);
+    }
+
+    ratchet.chainKey = nextChainKey(ratchet.chainKey);
+    ratchet.messageNumber++;
+
+    const dhPublic = didDHRatchet ? nacl.encodeBase64(newDhPublic) : null;
+
+    await saveSession(`${chatId}-${memberId}`, session);
+
+    results.push({
+      recipientId: memberId,
+      ciphertext: nacl.encodeBase64(encrypted),
+      nonce: nacl.encodeBase64(nonce),
+      dhPublic,
+      msgNum: ratchet.messageNumber - 1,
+      mediaCiphertext,
+      mediaNonce,
+    });
+  }
+
+  return results;
+}
+
 // ==================== Group Sender Key Encrypt/Decrypt ====================
 
 export async function groupEncrypt(

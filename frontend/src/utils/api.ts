@@ -160,6 +160,15 @@ export const encryptedMessagesAPI = {
     self_destruct_seconds?: number | null;
     is_emergency?: boolean;
   }) => api.post('/messages/encrypted', data),
+  sendPairwise: (data: {
+    chat_id: string;
+    message_type: string;
+    security_level: string;
+    self_destruct_seconds?: number | null;
+    is_emergency?: boolean;
+    reply_to?: string | null;
+    recipients: { user_id: string; ciphertext: string; nonce: string; dh_public?: string | null; msg_num?: number; media_ciphertext?: string | null; media_nonce?: string | null }[];
+  }) => api.post('/messages/encrypted-pairwise', data),
 };
 
 export default api;

@@ -1817,6 +1817,91 @@ async def send_encrypted_message(input: EncryptedMessageSend, user: dict = Depen
     
     return {"message": serialized}
 
+# ==================== PAIRWISE GROUP E2EE ====================
+
+class PairwiseEncryptedMessageSend(BaseModel):
+    chat_id: str
+    message_type: str = "text"
+    security_level: str = "UNCLASSIFIED"
+    self_destruct_seconds: Optional[int] = Field(default=None, ge=5, le=604800)
+    is_emergency: bool = False
+    reply_to: Optional[str] = None
+    # Per-recipient encrypted payloads
+    recipients: List[dict]  # [{user_id, ciphertext, nonce, dh_public?, msg_num?, media_ciphertext?, media_nonce?}]
+    @field_validator('security_level')
+    @classmethod
+    def validate_sec(cls, v: str) -> str:
+        if v not in VALID_SECURITY_LEVELS:
+            raise ValueError(f'Ungültige Sicherheitsstufe.')
+        return v
+    @field_validator('message_type')
+    @classmethod
+    def validate_msg_type(cls, v: str) -> str:
+        if v not in VALID_MESSAGE_TYPES:
+            raise ValueError(f'Ungültiger Nachrichtentyp.')
+        return v
+
+@api_router.post("/messages/encrypted-pairwise")
+async def send_pairwise_encrypted_message(input: PairwiseEncryptedMessageSend, user: dict = Depends(get_current_user)):
+    """Send a pairwise E2EE group message. Each recipient gets their own ciphertext."""
+    chat = await db.chats.find_one({"_id": ObjectId(input.chat_id), "participant_ids": ObjectId(user["id"])})
+    if not chat:
+        raise HTTPException(status_code=404, detail="Chat nicht gefunden")
+    if not chat.get("is_group"):
+        raise HTTPException(status_code=400, detail="Pairwise nur für Gruppen")
+
+    # Validate all ciphertexts
+    for r in input.recipients:
+        if not BASE64_REGEX.match(r.get("ciphertext", "")) or not BASE64_REGEX.match(r.get("nonce", "")):
+            raise HTTPException(status_code=400, detail=f"Ungültige verschlüsselte Daten für {r.get('user_id')}")
+
+    now = datetime.now(timezone.utc)
+
+    # Build per-recipient ciphertext map
+    recipient_ciphertexts = {}
+    for r in input.recipients:
+        uid = r["user_id"]
+        recipient_ciphertexts[uid] = {
+            "ciphertext": r["ciphertext"],
+            "nonce": r["nonce"],
+            "dh_public": r.get("dh_public"),
+            "msg_num": r.get("msg_num"),
+            "media_ciphertext": r.get("media_ciphertext"),
+            "media_nonce": r.get("media_nonce"),
+        }
+
+    msg_doc = {
+        "chat_id": input.chat_id,
+        "sender_id": user["id"],
+        "sender_name": user.get("name", "Unbekannt"),
+        "sender_callsign": user.get("callsign", ""),
+        "message_type": input.message_type,
+        "security_level": input.security_level,
+        "self_destruct_seconds": input.self_destruct_seconds,
+        "self_destruct_at": (now + timedelta(seconds=input.self_destruct_seconds)) if input.self_destruct_seconds else None,
+        "is_emergency": input.is_emergency,
+        "reply_to": input.reply_to,
+        "pairwise_ciphertexts": recipient_ciphertexts,
+        "status": "sent",
+        "delivered_to": [],
+        "read_by": [user["id"]],
+        "created_at": now,
+        "encrypted": True,
+        "e2ee": True,
+        "pairwise": True,
+    }
+    result = await db.messages.insert_one(msg_doc)
+    msg_doc["_id"] = result.inserted_id
+    serialized = serialize_message(msg_doc)
+
+    await ws_emit_to_chat(input.chat_id, 'message:new', serialized)
+
+    other_participants = [pid for pid in chat.get("participant_ids", []) if str(pid) != user["id"]]
+    for pid in other_participants:
+        await send_push_notification(str(pid), input.chat_id)
+
+    return {"message": serialized}
+
 # ==================== STARTUP ====================
 
 @app.on_event("startup")
