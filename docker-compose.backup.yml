@@ -1,0 +1,31 @@
+# SS-Note MongoDB Backup Service
+# Automated backups with 7-day rotation
+# Usage: docker compose -f docker-compose.yml -f docker-compose.backup.yml up -d
+
+services:
+  mongo-backup:
+    image: mongo:7
+    restart: unless-stopped
+    volumes:
+      - mongo_data:/data/db:ro
+      - ./backups:/backups
+    environment:
+      - MONGO_URL=mongodb://mongo:27017
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo "MongoDB Backup Service started"
+        while true; do
+          TIMESTAMP=$$(date +%Y%m%d_%H%M%S)
+          echo "[$$TIMESTAMP] Starting backup..."
+          mongodump --uri="$$MONGO_URL" --out=/backups/$$TIMESTAMP --gzip
+          echo "[$$TIMESTAMP] Backup completed"
+
+          # Remove backups older than 7 days
+          find /backups -maxdepth 1 -type d -mtime +7 -exec rm -rf {} \;
+          echo "[$$TIMESTAMP] Cleanup completed"
+
+          sleep 86400
+        done
+    networks:
+      - internal

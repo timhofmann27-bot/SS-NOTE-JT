@@ -1416,6 +1416,45 @@ async def get_typing(chat_id: str, user: dict = Depends(get_current_user)):
 
 @api_router.get("/health")
 async def health():
+    """Detailed health check for monitoring and load balancers"""
+    health_data = {
+        "status": "ok",
+        "service": "SS-Note",
+        "version": "2.1.0",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "components": {},
+    }
+
+    # MongoDB check
+    try:
+        await db.admin.command("ping")
+        health_data["components"]["mongodb"] = {"status": "ok"}
+    except Exception as e:
+        health_data["components"]["mongodb"] = {"status": "error", "detail": str(e)}
+        health_data["status"] = "degraded"
+
+    # Connected users count
+    try:
+        health_data["connected_users"] = sum(len(sids) for sids in connected_users.values())
+        health_data["active_chats"] = len(connected_users)
+    except Exception:
+        pass
+
+    # Database stats (anonymized)
+    try:
+        health_data["stats"] = {
+            "total_users": await db.users.count_documents({}),
+            "total_chats": await db.chats.count_documents({}),
+            "total_messages": await db.messages.count_documents({}),
+        }
+    except Exception:
+        pass
+
+    return health_data
+
+@app.get("/api/health")
+async def public_health():
+    """Public health endpoint (no auth, minimal info)"""
     return {"status": "ok", "service": "SS-Note", "timestamp": datetime.now(timezone.utc).isoformat()}
 
 # ==================== USERNAME GENERATOR ====================

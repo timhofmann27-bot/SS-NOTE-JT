@@ -1,5 +1,11 @@
-# SS-Note -- Docker Compose (Self-Hosted / Militär-Ready)
-# Usage: docker compose up -d && curl -f https://yourapp.com/api/health
+# SS-Note -- Docker Compose (Production-Ready)
+# Usage: docker compose up -d
+#
+# Environment variables (.env file):
+#   JWT_SECRET=<64+ char secret>
+#   DOMAIN=messenger.example.com
+#   ACME_EMAIL=admin@example.com
+#   FRONTEND_URL=https://messenger.example.com
 
 services:
   # ==================== APP (FastAPI + Socket.IO) ====================
@@ -21,10 +27,9 @@ services:
       - MONGO_URL=mongodb://mongo:27017
       - DB_NAME=ssnote_db
       - JWT_SECRET=${JWT_SECRET}
-      - FRONTEND_URL=http://localhost:19006
-      - TESTING=true
-    ports:
-      - "8001:8001"
+      - FRONTEND_URL=${FRONTEND_URL:-http://localhost:19006}
+      - TESTING=${TESTING:-false}
+      - SECURE_COOKIES=true
     depends_on:
       mongo:
         condition: service_healthy
@@ -32,14 +37,20 @@ services:
       - internal
     labels:
       - "traefik.enable=true"
-      - "traefik.http.routers.api.rule=Host(`${DOMAIN:-messenger.example.com}`) && PathPrefix(`/api`)"
-      - "traefik.http.routers.api.tls.certresolver=letsencrypt"
-      - "traefik.http.services.api.loadbalancer.server.port=8001"
+      - "traefik.http.routers.ss-note.rule=Host(`${DOMAIN:-messenger.example.com}`)"
+      - "traefik.http.routers.ss-note.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.ss-note.entrypoints=websecure"
+      - "traefik.http.services.ss-note.loadbalancer.server.port=8001"
+      - "traefik.http.middlewares.ss-note-headers.headers.customResponseHeaders.X-Content-Type-Options=nosniff"
+      - "traefik.http.middlewares.ss-note-headers.headers.customResponseHeaders.X-Frame-Options=DENY"
+      - "traefik.http.middlewares.ss-note-headers.headers.customResponseHeaders.Referrer-Policy=no-referrer"
+      - "traefik.http.routers.ss-note.middlewares=ss-note-headers"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8001/api/health"]
       interval: 30s
       timeout: 5s
       retries: 3
+      start_period: 10s
 
   # ==================== MONGODB ====================
   mongo:
@@ -49,12 +60,16 @@ services:
       - mongo_data:/data/db
     networks:
       - internal
-    command: ["--wiredTigerCacheSizeGB", "0.5", "--quiet"]
+    command: ["--wiredTigerCacheSizeGB", "0.5", "--quiet", "--auth"]
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=${MONGO_USER:-ssnote}
+      - MONGO_INITDB_ROOT_PASSWORD=${MONGO_PASS:-change-me-in-production}
     healthcheck:
       test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
       interval: 30s
       timeout: 10s
       retries: 3
+      start_period: 20s
 
   # ==================== TRAEFIK (Reverse Proxy + AutoTLS) ====================
   traefik:
@@ -72,13 +87,18 @@ services:
       - "--entrypoints.web.address=:80"
       - "--entrypoints.websecure.address=:443"
       - "--entrypoints.web.http.redirections.entryPoint.to=websecure"
+      - "--entrypoints.web.http.redirections.entryPoint.scheme=https"
+      - "--entrypoints.web.http.redirections.entryPoint.permanent=true"
       - "--certificatesresolvers.letsencrypt.acme.tlschallenge=true"
       - "--certificatesresolvers.letsencrypt.acme.email=${ACME_EMAIL:-admin@example.com}"
       - "--certificatesresolvers.letsencrypt.acme.storage=/certs/acme.json"
       - "--api.dashboard=false"
       - "--log.level=WARN"
+      - "--accesslog=false"
     networks:
       - internal
+    security_opt:
+      - no-new-privileges:true
 
 volumes:
   mongo_data:
@@ -88,3 +108,5 @@ volumes:
 networks:
   internal:
     driver: bridge
+    internal: true  # No external access except through Traefik
+
