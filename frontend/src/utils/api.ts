@@ -90,6 +90,12 @@ export const chatsAPI = {
   get: (id: string) => api.get(`/chats/${id}`),
   pollUpdates: () => api.get('/chats/poll/updates'),
   leave: (id: string) => api.post(`/chats/${id}/leave`),
+  addMember: (id: string, contactId: string) => api.post(`/chats/${id}/add-member`, { contact_id: contactId }),
+  removeMember: (id: string, memberId: string) => api.post(`/chats/${id}/remove-member`, { member_id: memberId }),
+  update: (id: string, data: any) => api.put(`/chats/${id}`, data),
+  pinMessage: (id: string, messageId: string) => api.post(`/chats/${id}/pin-message`, { message_id: messageId }),
+  unpinMessage: (id: string) => api.post(`/chats/${id}/unpin-message`),
+  export: (id: string) => api.post(`/chats/${id}/export`),
 };
 
 export const messagesAPI = {
@@ -98,6 +104,12 @@ export const messagesAPI = {
   markRead: (messageIds: string[]) => api.post('/messages/read', { message_ids: messageIds }),
   poll: (chatId: string, after?: string) => api.get(`/messages/poll/${chatId}`, { params: { after } }),
   delete: (id: string) => api.delete(`/messages/${id}`),
+  edit: (id: string, content: string) => api.put(`/messages/${id}`, { content }),
+  react: (id: string, emoji: string) => api.post(`/messages/${id}/react`, { emoji }),
+  star: (id: string) => api.post(`/messages/${id}/star`),
+  getStarred: (chatId: string) => api.get(`/messages/starred/${chatId}`),
+  search: (chatId: string, q: string) => api.get(`/messages/search/${chatId}`, { params: { q } }),
+  forward: (id: string, chatId: string) => api.post(`/messages/${id}/forward`, { chat_id: chatId }),
 };
 
 export const typingAPI = {

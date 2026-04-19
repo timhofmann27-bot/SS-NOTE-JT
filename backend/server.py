@@ -839,6 +839,180 @@ async def leave_chat(chat_id: str, user: dict = Depends(get_current_user)):
         await db.messages.delete_many({"chat_id": chat_id})
     return {"message": "Gruppe verlassen"}
 
+@api_router.post("/chats/{chat_id}/add-member")
+async def add_group_member(chat_id: str, request: Request, user: dict = Depends(get_current_user)):
+    """Add a member to a group (admin only)"""
+    oid = validate_object_id(chat_id)
+    chat = await db.chats.find_one({"_id": oid, "participant_ids": ObjectId(user["id"])})
+    if not chat:
+        raise HTTPException(status_code=404, detail="Chat nicht gefunden")
+    if not chat.get("is_group"):
+        raise HTTPException(status_code=400, detail="Nur bei Gruppen möglich")
+    body = await request.json()
+    contact_id = body.get("contact_id")
+    if not contact_id:
+        raise HTTPException(status_code=400, detail="contact_id erforderlich")
+    user_contacts = await db.contacts.find({"owner_id": user["id"]}).to_list(1000)
+    contact_ids = {c["contact_id"] for c in user_contacts}
+    if contact_id not in contact_ids:
+        raise HTTPException(status_code=403, detail="Nur Kontakte können hinzugefügt werden")
+    if contact_id in [str(p) for p in chat.get("participant_ids", [])]:
+        raise HTTPException(status_code=400, detail="Bereits Mitglied")
+    await db.chats.update_one({"_id": oid}, {"$addToSet": {"participant_ids": ObjectId(contact_id)}})
+    await ws_emit_to_chat(chat_id, 'chat:member_added', {'user_id': user["id"], 'added_id': contact_id, 'chat_id': chat_id})
+    return {"message": "Mitglied hinzugefügt"}
+
+@api_router.post("/chats/{chat_id}/remove-member")
+async def remove_group_member(chat_id: str, request: Request, user: dict = Depends(get_current_user)):
+    """Remove a member from a group (admin only)"""
+    oid = validate_object_id(chat_id)
+    chat = await db.chats.find_one({"_id": oid})
+    if not chat:
+        raise HTTPException(status_code=404, detail="Chat nicht gefunden")
+    if str(chat.get("created_by")) != user["id"]:
+        raise HTTPException(status_code=403, detail="Nur der Ersteller kann Mitglieder entfernen")
+    body = await request.json()
+    member_id = body.get("member_id")
+    if not member_id:
+        raise HTTPException(status_code=400, detail="member_id erforderlich")
+    if member_id == user["id"]:
+        raise HTTPException(status_code=400, detail="Ersteller kann sich nicht selbst entfernen")
+    await db.chats.update_one({"_id": oid}, {"$pull": {"participant_ids": ObjectId(member_id)}})
+    await ws_emit_to_chat(chat_id, 'chat:member_removed', {'user_id': user["id"], 'removed_id': member_id, 'chat_id': chat_id})
+    return {"message": "Mitglied entfernt"}
+
+@api_router.put("/chats/{chat_id}")
+async def update_chat(chat_id: str, request: Request, user: dict = Depends(get_current_user)):
+    """Update group name or settings (admin only)"""
+    oid = validate_object_id(chat_id)
+    chat = await db.chats.find_one({"_id": oid, "participant_ids": ObjectId(user["id"])})
+    if not chat:
+        raise HTTPException(status_code=404, detail="Chat nicht gefunden")
+    if str(chat.get("created_by")) != user["id"]:
+        raise HTTPException(status_code=403, detail="Nur der Ersteller kann Einstellungen ändern")
+    body = await request.json()
+    updates = {}
+    if "name" in body: updates["name"] = body["name"]
+    if "security_level" in body: updates["security_level"] = body["security_level"]
+    if updates:
+        await db.chats.update_one({"_id": oid}, {"$set": updates})
+    return {"message": "Chat aktualisiert"}
+
+@api_router.post("/chats/{chat_id}/pin-message")
+async def pin_message(chat_id: str, request: Request, user: dict = Depends(get_current_user)):
+    """Pin a message to the top of the chat"""
+    body = await request.json()
+    message_id = body.get("message_id")
+    if not message_id:
+        raise HTTPException(status_code=400, detail="message_id erforderlich")
+    msg = await db.messages.find_one({"_id": ObjectId(message_id), "chat_id": chat_id})
+    if not msg:
+        raise HTTPException(status_code=404, detail="Nachricht nicht gefunden")
+    await db.chats.update_one({"_id": ObjectId(chat_id)}, {"$set": {"pinned_message_id": message_id, "pinned_by": user["id"], "pinned_at": datetime.now(timezone.utc)}})
+    await ws_emit_to_chat(chat_id, 'chat:pinned', {'message_id': message_id, 'chat_id': chat_id})
+    return {"message": "Nachricht angeheftet"}
+
+@api_router.post("/chats/{chat_id}/unpin-message")
+async def unpin_message(chat_id: str, request: Request, user: dict = Depends(get_current_user)):
+    """Remove pinned message"""
+    await db.chats.update_one({"_id": ObjectId(chat_id)}, {"$unset": {"pinned_message_id": "", "pinned_by": "", "pinned_at": ""}})
+    await ws_emit_to_chat(chat_id, 'chat:unpinned', {'chat_id': chat_id})
+    return {"message": "Anheften entfernt"}
+
+@api_router.post("/messages/{message_id}/star")
+async def star_message(message_id: str, user: dict = Depends(get_current_user)):
+    """Star/unstar a message"""
+    oid = validate_object_id(message_id)
+    msg = await db.messages.find_one({"_id": oid})
+    if not msg:
+        raise HTTPException(status_code=404, detail="Nachricht nicht gefunden")
+    chat = await db.chats.find_one({"_id": ObjectId(msg["chat_id"]), "participant_ids": ObjectId(user["id"])})
+    if not chat:
+        raise HTTPException(status_code=403, detail="Kein Zugriff")
+    starred = msg.get("starred_by", [])
+    if user["id"] in starred:
+        starred.remove(user["id"])
+    else:
+        starred.append(user["id"])
+    await db.messages.update_one({"_id": oid}, {"$set": {"starred_by": starred}})
+    return {"message": "Stern aktualisiert", "starred": user["id"] in starred}
+
+@api_router.get("/messages/starred/{chat_id}")
+async def get_starred_messages(chat_id: str, user: dict = Depends(get_current_user)):
+    """Get all starred messages in a chat"""
+    chat = await db.chats.find_one({"_id": ObjectId(chat_id), "participant_ids": ObjectId(user["id"])})
+    if not chat:
+        raise HTTPException(status_code=404, detail="Chat nicht gefunden")
+    messages = await db.messages.find({"chat_id": chat_id, "starred_by": user["id"]}).sort("created_at", -1).to_list(100)
+    return {"messages": [serialize_message(m) for m in messages]}
+
+@api_router.get("/messages/search/{chat_id}")
+async def search_messages(chat_id: str, q: str, user: dict = Depends(get_current_user)):
+    """Search messages in a chat (only works for non-E2EE or client-side)"""
+    chat = await db.chats.find_one({"_id": ObjectId(chat_id), "participant_ids": ObjectId(user["id"])})
+    if not chat:
+        raise HTTPException(status_code=404, detail="Chat nicht gefunden")
+    query = {"chat_id": chat_id, "content": {"$regex": q, "$options": "i"}}
+    messages = await db.messages.find(query).sort("created_at", -1).limit(50).to_list(50)
+    return {"messages": [serialize_message(m) for m in messages], "query": q}
+
+@api_router.post("/messages/{message_id}/forward")
+async def forward_message(message_id: str, request: Request, user: dict = Depends(get_current_user)):
+    """Forward a message to another chat"""
+    oid = validate_object_id(message_id)
+    msg = await db.messages.find_one({"_id": oid})
+    if not msg:
+        raise HTTPException(status_code=404, detail="Nachricht nicht gefunden")
+    body = await request.json()
+    target_chat_id = body.get("chat_id")
+    if not target_chat_id:
+        raise HTTPException(status_code=400, detail="chat_id erforderlich")
+    target_chat = await db.chats.find_one({"_id": ObjectId(target_chat_id), "participant_ids": ObjectId(user["id"])})
+    if not target_chat:
+        raise HTTPException(status_code=404, detail="Ziel-Chat nicht gefunden")
+    now = datetime.now(timezone.utc)
+    fwd_content = f"↪️ Weitergeleitet: {msg.get('content', '')[:100]}"
+    fwd_doc = {
+        "chat_id": target_chat_id,
+        "sender_id": user["id"],
+        "sender_name": user.get("name", "Unbekannt"),
+        "sender_callsign": user.get("callsign", ""),
+        "content": fwd_content,
+        "message_type": msg.get("message_type", "text"),
+        "security_level": msg.get("security_level", "UNCLASSIFIED"),
+        "media_base64": msg.get("media_base64"),
+        "forwarded_from": msg["_id"],
+        "forwarded_from_chat": msg["chat_id"],
+        "forwarded_from_user": msg.get("sender_id"),
+        "status": "sent",
+        "delivered_to": [],
+        "read_by": [user["id"]],
+        "created_at": now,
+        "encrypted": True,
+    }
+    result = await db.messages.insert_one(fwd_doc)
+    fwd_doc["_id"] = result.inserted_id
+    serialized = serialize_message(fwd_doc)
+    await ws_emit_to_chat(target_chat_id, 'message:new', serialized)
+    return {"message": serialized}
+
+@api_router.post("/chats/{chat_id}/export")
+async def export_chat(chat_id: str, user: dict = Depends(get_current_user)):
+    """Export chat messages as JSON (client-side decryptable)"""
+    chat = await db.chats.find_one({"_id": ObjectId(chat_id), "participant_ids": ObjectId(user["id"])})
+    if not chat:
+        raise HTTPException(status_code=404, detail="Chat nicht gefunden")
+    messages = await db.messages.find({"chat_id": chat_id}).sort("created_at", 1).to_list(10000)
+    export_data = {
+        "chat_id": chat_id,
+        "chat_name": chat.get("name"),
+        "is_group": chat.get("is_group"),
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "message_count": len(messages),
+        "messages": [serialize_message(m) for m in messages],
+    }
+    return {"export": export_data}
+
 # ==================== MESSAGES ====================
 
 @api_router.post("/messages")
