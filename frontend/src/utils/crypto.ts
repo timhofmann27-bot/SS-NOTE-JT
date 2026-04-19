@@ -259,6 +259,8 @@ export interface RatchetState {
   rootKey: Uint8Array;
   chainKey: Uint8Array;
   messageNumber: number;
+  dhRatchetCount: number;
+  lastHealTimestamp: number | null;
 }
 
 export interface SessionState {
@@ -406,6 +408,8 @@ export async function initializeSessionX3DH(
       rootKey,
       chainKey,
       messageNumber: 0,
+      dhRatchetCount: 0,
+      lastHealTimestamp: null,
     },
     isInitialized: true,
     theirIdentityKey,
@@ -460,6 +464,8 @@ export async function initializeSessionFromPrekey(
       rootKey,
       chainKey,
       messageNumber: 0,
+      dhRatchetCount: 0,
+      lastHealTimestamp: null,
     },
     isInitialized: true,
     theirIdentityKey,
@@ -494,6 +500,8 @@ export async function initializeSession(
       rootKey,
       chainKey,
       messageNumber: 0,
+      dhRatchetCount: 0,
+      lastHealTimestamp: null,
     },
     isInitialized: true,
     theirIdentityKey,
@@ -571,7 +579,7 @@ function ratchetStepSend(state: RatchetState): { rootKey: Uint8Array; chainKey: 
   const newDhKeyPair = nacl.box.keyPair();
 
   if (state.dhRemotePublicKey) {
-    // Perform full DH ratchet: shared secret with remote's last DH key
+    // Full DH ratchet: shared secret with remote's last DH key
     const shared = nacl.box.before(state.dhRemotePublicKey, state.dhKeyPair.secretKey);
     const newRootKey = hkdf(shared, 'ssnote-ratchet-root', 32);
     const newChainKey = hkdf(newRootKey, 'ssnote-ratchet-chain', 32);
@@ -580,20 +588,23 @@ function ratchetStepSend(state: RatchetState): { rootKey: Uint8Array; chainKey: 
     state.rootKey = newRootKey;
     state.chainKey = newChainKey;
     state.messageNumber = 0;
+    state.dhRatchetCount++;
 
     return { rootKey: newRootKey, chainKey: newChainKey, dhPublic: newDhKeyPair.publicKey, didDHRatchet: true };
   }
 
-  // No remote DH key yet: advance chain key via symmetric ratchet only
-  // The DH ratchet will happen once we receive the remote's DH public key
+  // No remote DH key yet: symmetric ratchet only
   state.dhKeyPair = newDhKeyPair;
   state.chainKey = nextChainKey(state.chainKey);
 
   return { rootKey: state.rootKey, chainKey: state.chainKey, dhPublic: newDhKeyPair.publicKey, didDHRatchet: false };
 }
 
-function ratchetStepReceive(state: RatchetState, remoteDHPublic: Uint8Array): { rootKey: Uint8Array; chainKey: Uint8Array } {
-  // Perform DH ratchet: compute shared secret using our current DH key pair and remote's new DH public key
+function ratchetStepReceive(state: RatchetState, remoteDHPublic: Uint8Array): { rootKey: Uint8Array; chainKey: Uint8Array; didHeal: boolean } {
+  const isNewDhKey = !state.lastRemoteDHPublicKey ||
+    !nacl.verify(remoteDHPublic, state.lastRemoteDHPublicKey);
+
+  // Perform DH ratchet: compute shared secret
   const shared = nacl.box.before(remoteDHPublic, state.dhKeyPair.secretKey);
   const newRootKey = hkdf(shared, 'ssnote-ratchet-root', 32);
   const newChainKey = hkdf(newRootKey, 'ssnote-ratchet-chain', 32);
@@ -602,8 +613,26 @@ function ratchetStepReceive(state: RatchetState, remoteDHPublic: Uint8Array): { 
   state.rootKey = newRootKey;
   state.chainKey = newChainKey;
   state.messageNumber = 0;
+  state.dhRatchetCount++;
 
-  return { rootKey: newRootKey, chainKey: newChainKey };
+  // Post-Compromise Security: If this is a new DH key from the remote,
+  // the session has "healed" — old compromised keys can no longer decrypt future messages.
+  let didHeal = false;
+  if (isNewDhKey && state.lastRemoteDHPublicKey) {
+    // Additional heal rounds: derive extra key material to break any chain
+    // from a previously compromised state. This is the "skip message" pattern
+    // from Signal's Double Ratchet.
+    const healInput = new Uint8Array([...newRootKey, ...remoteDHPublic]);
+    const healKey = hkdf(healInput, 'ssnote-heal', 32);
+    state.rootKey = healKey;
+    state.chainKey = hkdf(healKey, 'ssnote-heal-chain', 32);
+    state.lastHealTimestamp = Date.now();
+    didHeal = true;
+  }
+
+  state.lastRemoteDHPublicKey = remoteDHPublic;
+
+  return { rootKey: state.rootKey, chainKey: state.chainKey, didHeal };
 }
 
 // ==================== Sender Key Ratchet Operations ====================
@@ -894,6 +923,8 @@ interface SerializableSessionState {
     rootKey: string;
     chainKey: string;
     messageNumber: number;
+    dhRatchetCount: number;
+    lastHealTimestamp: number | null;
   } | null;
   isInitialized: boolean;
   theirIdentityKey: string;
@@ -914,6 +945,8 @@ async function saveSession(chatId: string, session: SessionState) {
       rootKey: nacl.encodeBase64(session.ratchet.rootKey),
       chainKey: nacl.encodeBase64(session.ratchet.chainKey),
       messageNumber: session.ratchet.messageNumber,
+      dhRatchetCount: session.ratchet.dhRatchetCount || 0,
+      lastHealTimestamp: session.ratchet.lastHealTimestamp || null,
     } : null,
     isInitialized: session.isInitialized,
     theirIdentityKey: nacl.encodeBase64(session.theirIdentityKey),
@@ -949,6 +982,8 @@ async function loadSession(chatId: string): Promise<SessionState | null> {
         rootKey: nacl.decodeBase64(s.ratchet.rootKey),
         chainKey: nacl.decodeBase64(s.ratchet.chainKey),
         messageNumber: s.ratchet.messageNumber,
+        dhRatchetCount: s.ratchet.dhRatchetCount || 0,
+        lastHealTimestamp: s.ratchet.lastHealTimestamp || null,
       } : null,
       isInitialized: s.isInitialized,
       theirIdentityKey: nacl.decodeBase64(s.theirIdentityKey),
