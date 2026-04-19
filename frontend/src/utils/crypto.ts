@@ -1,10 +1,12 @@
 import Storage from './Storage';
 import nacl from 'tweetnacl';
 import { utf8Encode, utf8Decode } from 'tweetnacl-util';
+import * as kyber from 'pqc-kyber';
 
 // Storage keys
 const KEYPAIR_STORAGE = 'tn-keybox';
 const SIGNING_KEYPAIR_STORAGE = 'tn-signing-keybox';
+const KYBER_KEYPAIR_STORAGE = 'tn-kyber-keybox';
 const SIGNED_PREKEY_STORAGE = 'tn-signed-prekey';
 const OTP_STORAGE_PREFIX = 'tn-otp-';
 const SESSION_PREFIX = 'tn-session-';
@@ -34,6 +36,27 @@ export async function getKeyPair(): Promise<naclBoxKeyPair | null> {
   return {
     publicKey: raw.slice(0, nacl.box.publicKeyLength),
     secretKey: raw.slice(nacl.box.publicKeyLength),
+  };
+}
+
+// ==================== Kyber Key Management ====================
+
+const KYBER_PK_LEN = 1184; // Kyber-768 public key size
+const KYBER_SK_LEN = 2400; // Kyber-768 secret key size
+
+export async function storeKyberKeyPair(keyPair: KyberKeyPair) {
+  const combined = new Uint8Array([...keyPair.publicKey, ...keyPair.secretKey]);
+  await Storage.setItemAsync(KYBER_KEYPAIR_STORAGE, nacl.encodeBase64(combined));
+}
+
+export async function getKyberKeyPair(): Promise<KyberKeyPair | null> {
+  const stored = await Storage.getItemAsync(KYBER_KEYPAIR_STORAGE);
+  if (!stored) return null;
+  const raw = nacl.decodeBase64(stored);
+  if (raw.length !== KYBER_PK_LEN + KYBER_SK_LEN) return null;
+  return {
+    publicKey: raw.slice(0, KYBER_PK_LEN),
+    secretKey: raw.slice(KYBER_PK_LEN),
   };
 }
 
@@ -309,6 +332,51 @@ export interface PrekeyBundle {
   signedPreKeyId: string;
   signature: string;          // base64 — Ed25519 signature of signedPreKey
   oneTimePreKeys: { id: string; key: string }[];  // base64 keys
+  pqPublicKey?: string;       // base64 — Kyber-768 public key
+}
+
+// ==================== Post-Quantum Hybrid KEM ====================
+// Signal/Threema Pattern: X25519 + Kyber-768
+// - Klassisches X25519 DH für etablierte Sicherheit
+// - Kyber-768 (CRYSTALS-Kyber) für Post-Quantum-Sicherheit
+// - Beide Shared Secrets werden via HKDF kombiniert
+// - Selbst wenn einer der beiden Algorithmen gebrochen wird, bleibt der andere sicher
+
+export interface KyberKeyPair {
+  publicKey: Uint8Array;
+  secretKey: Uint8Array;
+}
+
+export function generateKyberKeyPair(): KyberKeyPair {
+  const keys = kyber.keypair();
+  return {
+    publicKey: keys.pubkey,
+    secretKey: keys.secret,
+  };
+}
+
+export function kyberEncapsulate(remotePublicKey: Uint8Array): {
+  ciphertext: Uint8Array;
+  sharedSecret: Uint8Array;
+} {
+  const kex = kyber.encapsulate(remotePublicKey);
+  return {
+    ciphertext: kex.ciphertext,
+    sharedSecret: kex.sharedSecret,
+  };
+}
+
+export function kyberDecapsulate(ciphertext: Uint8Array, secretKey: Uint8Array): Uint8Array {
+  return kyber.decapsulate(ciphertext, secretKey);
+}
+
+// Hybrid shared secret: HKDF(X25519-DH || Kyber-SS)
+export function hybridSharedSecret(
+  x25519Shared: Uint8Array,
+  kyberShared: Uint8Array
+): Uint8Array {
+  const combined = new Uint8Array([...x25519Shared, ...kyberShared]);
+  return hkdf(combined, 'ssnote-hybrid-pq', 32);
 }
 
 export interface PrekeyRecord {
@@ -382,17 +450,39 @@ export async function initializeSessionX3DH(
   const ephemeralKeyPair = nacl.box.keyPair();
   const dh3 = nacl.box.before(theirSignedPreKey, ephemeralKeyPair.secretKey);
 
+  // Post-Quantum: Kyber encapsulation if their public key is available
+  let kyberShared: Uint8Array | null = null;
+  let kyberCiphertext: Uint8Array | null = null;
+  if (theirBundle.pqPublicKey) {
+    const pqPubKey = nacl.decodeBase64(theirBundle.pqPublicKey);
+    const pqResult = kyberEncapsulate(pqPubKey);
+    kyberShared = pqResult.sharedSecret;
+    kyberCiphertext = pqResult.ciphertext;
+  }
+
   let sharedSecret: Uint8Array;
   if (theirOneTimePreKey) {
     // DH4: Our Ephemeral (secret) × Their One-Time PreKey (public)
     const dh4 = nacl.box.before(theirOneTimePreKey, ephemeralKeyPair.secretKey);
-    // SK = KDF(DH1 || DH2 || DH3 || DH4)
-    const combined = new Uint8Array([...dh1, ...dh2, ...dh3, ...dh4]);
-    sharedSecret = hkdf(combined, 'ssnote-x3dh-4way', 32);
+    const x25519Combined = new Uint8Array([...dh1, ...dh2, ...dh3, ...dh4]);
+    const x25519Secret = hkdf(x25519Combined, 'ssnote-x3dh-4way', 32);
+
+    if (kyberShared) {
+      // Hybrid: X25519 + Kyber
+      sharedSecret = hybridSharedSecret(x25519Secret, kyberShared);
+    } else {
+      sharedSecret = x25519Secret;
+    }
   } else {
     // 3-way fallback (no OTP available)
-    const combined = new Uint8Array([...dh1, ...dh2, ...dh3]);
-    sharedSecret = hkdf(combined, 'ssnote-x3dh-3way', 32);
+    const x25519Combined = new Uint8Array([...dh1, ...dh2, ...dh3]);
+    const x25519Secret = hkdf(x25519Combined, 'ssnote-x3dh-3way', 32);
+
+    if (kyberShared) {
+      sharedSecret = hybridSharedSecret(x25519Secret, kyberShared);
+    } else {
+      sharedSecret = x25519Secret;
+    }
   }
 
   const rootKey = hkdf(sharedSecret, 'ssnote-root', 32);
@@ -429,8 +519,10 @@ export async function initializeSessionFromPrekey(
   ourSigningKey: naclSignKeyPair,
   ourSignedPreKey: naclBoxKeyPair,
   ourOneTimePreKey: naclBoxKeyPair | null,
+  ourKyberSecretKey: Uint8Array | null,
   theirIdentityKey: Uint8Array,
   theirEphemeralKey: Uint8Array,
+  theirKyberCiphertext: Uint8Array | null,
   chatId: string
 ): Promise<SessionState> {
   // DH computations (mirror of sender side)
@@ -441,15 +533,33 @@ export async function initializeSessionFromPrekey(
   // DH3: Our Signed PreKey (secret) × Their Ephemeral (public)
   const dh3 = nacl.box.before(theirEphemeralKey, ourSignedPreKey.secretKey);
 
+  // Post-Quantum: Kyber decapsulation if we have the ciphertext
+  let kyberShared: Uint8Array | null = null;
+  if (ourKyberSecretKey && theirKyberCiphertext) {
+    kyberShared = kyberDecapsulate(theirKyberCiphertext, ourKyberSecretKey);
+  }
+
   let sharedSecret: Uint8Array;
   if (ourOneTimePreKey) {
     // DH4: Our One-Time PreKey (secret) × Their Ephemeral (public)
     const dh4 = nacl.box.before(theirEphemeralKey, ourOneTimePreKey.secretKey);
-    const combined = new Uint8Array([...dh1, ...dh2, ...dh3, ...dh4]);
-    sharedSecret = hkdf(combined, 'ssnote-x3dh-4way', 32);
+    const x25519Combined = new Uint8Array([...dh1, ...dh2, ...dh3, ...dh4]);
+    const x25519Secret = hkdf(x25519Combined, 'ssnote-x3dh-4way', 32);
+
+    if (kyberShared) {
+      sharedSecret = hybridSharedSecret(x25519Secret, kyberShared);
+    } else {
+      sharedSecret = x25519Secret;
+    }
   } else {
-    const combined = new Uint8Array([...dh1, ...dh2, ...dh3]);
-    sharedSecret = hkdf(combined, 'ssnote-x3dh-3way', 32);
+    const x25519Combined = new Uint8Array([...dh1, ...dh2, ...dh3]);
+    const x25519Secret = hkdf(x25519Combined, 'ssnote-x3dh-3way', 32);
+
+    if (kyberShared) {
+      sharedSecret = hybridSharedSecret(x25519Secret, kyberShared);
+    } else {
+      sharedSecret = x25519Secret;
+    }
   }
 
   const rootKey = hkdf(sharedSecret, 'ssnote-root', 32);
