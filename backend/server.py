@@ -148,7 +148,7 @@ async def invalid_id_handler(request: Request, exc: InvalidId):
 # ==================== CONSTANTS ====================
 VALID_SECURITY_LEVELS = ["UNCLASSIFIED", "RESTRICTED", "CONFIDENTIAL", "SECRET"]
 VALID_TRUST_LEVELS = ["UNVERIFIED", "VERIFIED", "TRUSTED", "BLOCKED"]
-VALID_MESSAGE_TYPES = ["text", "image", "voice", "file", "system"]
+VALID_MESSAGE_TYPES = ["text", "image", "voice", "file", "system", "poll", "location"]
 USERNAME_REGEX = re.compile(r'^[a-zA-Z0-9_\-\.]{3,30}$')
 BASE64_REGEX = re.compile(r'^[A-Za-z0-9+/]*={0,2}$')
 
@@ -317,6 +317,22 @@ class EncryptedMessageSend(BaseModel):
         if v not in VALID_MESSAGE_TYPES:
             raise ValueError(f'Ungültiger Nachrichtentyp.')
         return v
+
+class PollCreate(BaseModel):
+    question: str = Field(min_length=1, max_length=500)
+    options: List[str] = Field(min_length=2, max_length=10)
+    @field_validator('options')
+    @classmethod
+    def validate_options(cls, v: List[str]) -> List[str]:
+        cleaned = [opt.strip() for opt in v if opt.strip()]
+        if len(cleaned) < 2:
+            raise ValueError('Mindestens 2 Optionen erforderlich')
+        if len(cleaned) > 10:
+            raise ValueError('Maximal 10 Optionen erlaubt')
+        return cleaned
+
+class PollVote(BaseModel):
+    option_index: int = Field(ge=0, le=9)
 
 # ==================== HELPERS ====================
 
@@ -1085,7 +1101,21 @@ async def send_message(input: MessageSend, user: dict = Depends(get_current_user
     if not chat:
         raise HTTPException(status_code=404, detail="Chat nicht gefunden")
     now = datetime.now(timezone.utc)
-    msg_doc = {"chat_id": input.chat_id, "sender_id": user["id"], "sender_name": user.get("name", "Unbekannt"), "sender_callsign": user.get("callsign", ""), "content": input.content, "message_type": input.message_type, "security_level": input.security_level, "self_destruct_seconds": input.self_destruct_seconds, "self_destruct_at": (now + timedelta(seconds=input.self_destruct_seconds)) if input.self_destruct_seconds else None, "is_emergency": input.is_emergency, "media_base64": input.media_base64, "reply_to": input.reply_to, "status": "sent", "delivered_to": [], "read_by": [user["id"]], "created_at": now, "encrypted": True}
+
+    # Parse @mentions from content
+    mentions = []
+    if chat.get("is_group"):
+        mention_pattern = re.compile(r'@([a-zA-Z0-9_\-\.]{3,30})')
+        found_usernames = mention_pattern.findall(input.content)
+        if found_usernames:
+            participant_ids = [str(pid) for pid in chat.get("participant_ids", [])]
+            mentioned_users = await db.users.find({"username": {"$in": [u.lower() for u in found_usernames]}}).to_list(100)
+            for mu in mentioned_users:
+                mu_id = str(mu["_id"])
+                if mu_id in participant_ids and mu_id != user["id"]:
+                    mentions.append(mu_id)
+
+    msg_doc = {"chat_id": input.chat_id, "sender_id": user["id"], "sender_name": user.get("name", "Unbekannt"), "sender_callsign": user.get("callsign", ""), "content": input.content, "message_type": input.message_type, "security_level": input.security_level, "self_destruct_seconds": input.self_destruct_seconds, "self_destruct_at": (now + timedelta(seconds=input.self_destruct_seconds)) if input.self_destruct_seconds else None, "is_emergency": input.is_emergency, "media_base64": input.media_base64, "reply_to": input.reply_to, "mentions": mentions, "status": "sent", "delivered_to": [], "read_by": [user["id"]], "created_at": now, "encrypted": True}
     result = await db.messages.insert_one(msg_doc)
     preview = input.content[:50] if input.content else "[Medien]"
     if input.is_emergency: preview = "NOTFALL: " + preview
@@ -1103,6 +1133,15 @@ async def send_message(input: MessageSend, user: dict = Depends(get_current_user
 
     # WebSocket: Push new message to all chat participants in realtime
     await ws_emit_to_chat(input.chat_id, 'message:new', serialized)
+
+    # WebSocket: Notify mentioned users
+    for mentioned_user_id in mentions:
+        await ws_emit_to_user(mentioned_user_id, 'message:mention', {
+            "message": serialized,
+            "from_user_id": user["id"],
+            "from_username": user.get("username", ""),
+            "chat_id": input.chat_id,
+        })
 
     return {"message": serialized}
 
@@ -1217,6 +1256,18 @@ async def poll_messages(chat_id: str, after: Optional[str] = None, user: dict = 
     messages = await db.messages.find(query).sort("created_at", 1).to_list(100)
     return {"messages": [serialize_message(m) for m in messages]}
 
+@api_router.get("/messages/mentions")
+async def get_my_mentions(user: dict = Depends(get_current_user)):
+    """Alle Nachrichten zurückgeben, in denen der aktuelle Benutzer erwähnt wurde"""
+    messages = await db.messages.find({"mentions": user["id"]}).sort("created_at", -1).to_list(100)
+    return {"messages": [serialize_message(m) for m in messages]}
+
+@api_router.get("/messages/mentions/unread-count")
+async def get_unread_mentions_count(user: dict = Depends(get_current_user)):
+    """Anzahl der ungelesenen Erwähnungen für den aktuellen Benutzer"""
+    count = await db.messages.count_documents({"mentions": user["id"], "read_by": {"$nin": [user["id"]]}})
+    return {"unread_count": count}
+
 @api_router.get("/chats/poll/updates")
 async def poll_chat_updates(user: dict = Depends(get_current_user)):
     chats = await db.chats.find({"participant_ids": ObjectId(user["id"])}).sort("last_message_at", -1).to_list(100)
@@ -1232,6 +1283,110 @@ async def poll_chat_updates(user: dict = Depends(get_current_user)):
         chat_data["unread_count"] = unread
         result.append(chat_data)
     return {"chats": result}
+
+# ==================== POLLS ====================
+
+@api_router.post("/chats/{chat_id}/polls")
+async def create_poll(chat_id: str, input: PollCreate, user: dict = Depends(get_current_user)):
+    """Umfrage in einem Chat erstellen"""
+    chat = await db.chats.find_one({"_id": ObjectId(chat_id), "participant_ids": ObjectId(user["id"])})
+    if not chat:
+        raise HTTPException(status_code=404, detail="Chat nicht gefunden")
+    now = datetime.now(timezone.utc)
+    poll_data = {
+        "question": input.question,
+        "options": input.options,
+        "votes": [],
+    }
+    msg_doc = {
+        "chat_id": chat_id,
+        "sender_id": user["id"],
+        "sender_name": user.get("name", "Unbekannt"),
+        "sender_callsign": user.get("callsign", ""),
+        "content": input.question,
+        "message_type": "poll",
+        "security_level": "UNCLASSIFIED",
+        "poll_data": poll_data,
+        "status": "sent",
+        "delivered_to": [],
+        "read_by": [user["id"]],
+        "created_at": now,
+        "encrypted": False,
+    }
+    result = await db.messages.insert_one(msg_doc)
+    msg_doc["_id"] = result.inserted_id
+    serialized = serialize_message(msg_doc)
+    await ws_emit_to_chat(chat_id, 'message:new', serialized)
+    return {"poll": serialized}
+
+@api_router.get("/chats/{chat_id}/polls")
+async def list_polls(chat_id: str, user: dict = Depends(get_current_user)):
+    """Alle Umfragen in einem Chat auflisten"""
+    chat = await db.chats.find_one({"_id": ObjectId(chat_id), "participant_ids": ObjectId(user["id"])})
+    if not chat:
+        raise HTTPException(status_code=404, detail="Chat nicht gefunden")
+    polls = await db.messages.find({"chat_id": chat_id, "message_type": "poll"}).sort("created_at", -1).to_list(100)
+    return {"polls": [serialize_message(p) for p in polls]}
+
+@api_router.post("/polls/{poll_id}/vote")
+async def vote_poll(poll_id: str, input: PollVote, user: dict = Depends(get_current_user)):
+    """Für eine Umfrage-Option abstimmen"""
+    oid = validate_object_id(poll_id)
+    msg = await db.messages.find_one({"_id": oid, "message_type": "poll"})
+    if not msg:
+        raise HTTPException(status_code=404, detail="Umfrage nicht gefunden")
+    chat = await db.chats.find_one({"_id": ObjectId(msg["chat_id"]), "participant_ids": ObjectId(user["id"])})
+    if not chat:
+        raise HTTPException(status_code=403, detail="Kein Zugriff auf diesen Chat")
+    poll_data = msg.get("poll_data", {})
+    options = poll_data.get("options", [])
+    if input.option_index >= len(options):
+        raise HTTPException(status_code=400, detail="Ungültiger Options-Index")
+    votes = poll_data.get("votes", [])
+    # Remove existing vote from this user if any
+    votes = [v for v in votes if v.get("user_id") != user["id"]]
+    # Add new vote
+    votes.append({"option_index": input.option_index, "user_id": user["id"]})
+    await db.messages.update_one({"_id": oid}, {"$set": {"poll_data.votes": votes}})
+    # Fetch updated message
+    updated_msg = await db.messages.find_one({"_id": oid})
+    serialized = serialize_message(updated_msg)
+    await ws_emit_to_chat(msg["chat_id"], 'poll:voted', {
+        "poll_id": poll_id,
+        "chat_id": msg["chat_id"],
+        "votes": serialized.get("poll_data", {}).get("votes", []),
+    })
+    return {"message": "Stimme abgegeben", "poll": serialized}
+
+@api_router.get("/polls/{poll_id}")
+async def get_poll(poll_id: str, user: dict = Depends(get_current_user)):
+    """Umfrage-Ergebnisse abrufen (anonymisiert - ohne wer für was gestimmt hat)"""
+    oid = validate_object_id(poll_id)
+    msg = await db.messages.find_one({"_id": oid, "message_type": "poll"})
+    if not msg:
+        raise HTTPException(status_code=404, detail="Umfrage nicht gefunden")
+    chat = await db.chats.find_one({"_id": ObjectId(msg["chat_id"]), "participant_ids": ObjectId(user["id"])})
+    if not chat:
+        raise HTTPException(status_code=403, detail="Kein Zugriff auf diesen Chat")
+    poll_data = msg.get("poll_data", {})
+    # Anonymize votes: only return counts per option
+    votes = poll_data.get("votes", [])
+    option_counts = [0] * len(poll_data.get("options", []))
+    total_votes = len(votes)
+    for v in votes:
+        idx = v.get("option_index", 0)
+        if idx < len(option_counts):
+            option_counts[idx] += 1
+    result = {
+        "id": str(msg["_id"]),
+        "question": poll_data.get("question"),
+        "options": poll_data.get("options", []),
+        "option_counts": option_counts,
+        "total_votes": total_votes,
+        "created_at": msg["created_at"].isoformat() if isinstance(msg["created_at"], datetime) else msg["created_at"],
+        "created_by": msg.get("sender_id"),
+    }
+    return {"poll": result}
 
 # ==================== TYPING ====================
 
@@ -1674,6 +1829,8 @@ async def startup():
     await db.chats.create_index("participant_ids")
     await db.messages.create_index([("chat_id", 1), ("created_at", -1)])
     await db.messages.create_index("self_destruct_at", expireAfterSeconds=0)
+    await db.messages.create_index("mentions")
+    await db.messages.create_index([("message_type", 1), ("chat_id", 1)])
     await db.typing.create_index("at", expireAfterSeconds=10)
     await db.login_attempts.create_index("identifier")
     await db.login_attempts.create_index("locked_until", expireAfterSeconds=900)

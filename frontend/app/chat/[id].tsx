@@ -8,6 +8,8 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import * as ImagePicker from 'expo-image-picker';
 import * as DocumentPicker from 'expo-document-picker';
+import * as Location from 'expo-location';
+import { Platform } from 'react-native';
 import { useAuth } from '../../src/context/AuthContext';
 import { messagesAPI, chatsAPI, typingAPI, contactsAPI, keysAPI, encryptedMessagesAPI } from '../../src/utils/api';
 import api from '../../src/utils/api';
@@ -64,6 +66,7 @@ export default function ChatDetailScreen() {
   const [searchQuery, setSearchQuery] = useState('');
   const [showVerifyModal, setShowVerifyModal] = useState(false);
   const [contactVerified, setContactVerified] = useState(false);
+  const [sendingLocation, setSendingLocation] = useState(false);
   const flatListRef = useRef<FlatList>(null);
   const typingTimer = useRef<any>(null);
   const lastMsgId = useRef<string | null>(null);
@@ -389,6 +392,82 @@ export default function ChatDetailScreen() {
       console.log('Error sending voice message', e);
     } finally {
       setSending(false);
+    }
+  };
+
+  const handleSendLocation = async () => {
+    if (!id) return;
+    setSendingLocation(true);
+    try {
+      let latitude: number, longitude: number, accuracy: number;
+
+      if (Platform.OS === 'web') {
+        const pos = await new Promise<GeolocationPosition>((resolve, reject) => {
+          navigator.geolocation.getCurrentPosition(resolve, reject, { enableHighAccuracy: true });
+        });
+        latitude = pos.coords.latitude;
+        longitude = pos.coords.longitude;
+        accuracy = pos.coords.accuracy;
+      } else {
+        const { status } = await Location.requestForegroundPermissionsAsync();
+        if (status !== 'granted') {
+          Alert.alert('Fehler', 'Standortberechtigung benötigt');
+          return;
+        }
+        const loc = await Location.getCurrentPositionAsync({});
+        latitude = loc.coords.latitude;
+        longitude = loc.coords.longitude;
+        accuracy = loc.coords.accuracy || 0;
+      }
+
+      const locationData = JSON.stringify({ latitude, longitude, accuracy });
+
+      if (e2eeSessionRef.current) {
+        if (chat?.is_group) {
+          const encrypted = await groupEncrypt(`📍 Standort`, id, 'location', locationData);
+          if (encrypted) {
+            await encryptedMessagesAPI.send({
+              chat_id: id,
+              ciphertext: encrypted.ciphertext,
+              nonce: encrypted.nonce,
+              sender_key_id: encrypted.senderKeyId,
+              sender_key_iteration: encrypted.iteration,
+              message_type: 'location',
+              media_ciphertext: encrypted.mediaCiphertext,
+              media_nonce: encrypted.mediaNonce,
+              security_level: securityLevel,
+            });
+          }
+        } else {
+          const encrypted = await ratchetEncrypt(`📍 Standort`, id, 'location', locationData);
+          if (encrypted) {
+            await encryptedMessagesAPI.send({
+              chat_id: id,
+              ciphertext: encrypted.ciphertext,
+              nonce: encrypted.nonce,
+              dh_public: encrypted.dhPublic,
+              msg_num: encrypted.msgNum,
+              media_ciphertext: encrypted.mediaCiphertext,
+              media_nonce: encrypted.mediaNonce,
+              message_type: 'location',
+              security_level: securityLevel,
+            });
+          }
+        }
+      } else {
+        await messagesAPI.send({
+          chat_id: id,
+          content: `📍 Standort`,
+          message_type: 'location',
+          media_base64: locationData,
+          security_level: securityLevel,
+        });
+      }
+    } catch (e) {
+      console.log('Error sending location', e);
+      Alert.alert('Fehler', 'Standort konnte nicht gesendet werden');
+    } finally {
+      setSendingLocation(false);
     }
   };
 
@@ -1128,6 +1207,13 @@ export default function ChatDetailScreen() {
             </TouchableOpacity>
             <TouchableOpacity testID="attach-media-btn" onPress={() => setShowMediaMenu(!showMediaMenu)} style={styles.attachBtn}>
               <Ionicons name="add" size={20} color={COLORS.textMuted} />
+            </TouchableOpacity>
+            <TouchableOpacity testID="send-location-btn" onPress={handleSendLocation} style={styles.secBtn}>
+              {sendingLocation ? (
+                <ActivityIndicator size="small" color={COLORS.primaryLight} />
+              ) : (
+                <Ionicons name="location" size={20} color={COLORS.primaryLight} />
+              )}
             </TouchableOpacity>
             <View style={styles.inputContainer}>
               <TextInput

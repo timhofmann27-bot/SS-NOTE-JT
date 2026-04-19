@@ -1,4 +1,4 @@
-import * as SecureStore from 'expo-secure-store';
+import Storage from './Storage';
 import nacl from 'tweetnacl';
 import { utf8Encode, utf8Decode } from 'tweetnacl-util';
 
@@ -23,11 +23,11 @@ export function generateSigningKeyPair() {
 
 export async function storeKeyPair(keyPair: naclBoxKeyPair) {
   const combined = new Uint8Array([...keyPair.publicKey, ...keyPair.secretKey]);
-  await SecureStore.setItemAsync(KEYPAIR_STORAGE, nacl.encodeBase64(combined));
+  await Storage.setItemAsync(KEYPAIR_STORAGE, nacl.encodeBase64(combined));
 }
 
 export async function getKeyPair(): Promise<naclBoxKeyPair | null> {
-  const stored = await SecureStore.getItemAsync(KEYPAIR_STORAGE);
+  const stored = await Storage.getItemAsync(KEYPAIR_STORAGE);
   if (!stored) return null;
   const raw = nacl.decodeBase64(stored);
   if (raw.length !== nacl.box.publicKeyLength + nacl.box.secretKeyLength) return null;
@@ -41,11 +41,11 @@ export async function getKeyPair(): Promise<naclBoxKeyPair | null> {
 
 export async function storeSigningKeyPair(keyPair: naclSignKeyPair) {
   const combined = new Uint8Array([...keyPair.publicKey, ...keyPair.secretKey]);
-  await SecureStore.setItemAsync(SIGNING_KEYPAIR_STORAGE, nacl.encodeBase64(combined));
+  await Storage.setItemAsync(SIGNING_KEYPAIR_STORAGE, nacl.encodeBase64(combined));
 }
 
 export async function getSigningKeyPair(): Promise<naclSignKeyPair | null> {
-  const stored = await SecureStore.getItemAsync(SIGNING_KEYPAIR_STORAGE);
+  const stored = await Storage.getItemAsync(SIGNING_KEYPAIR_STORAGE);
   if (!stored) return null;
   const raw = nacl.decodeBase64(stored);
   if (raw.length !== nacl.sign.publicKeyLength + nacl.sign.secretKeyLength) return null;
@@ -64,11 +64,11 @@ export async function storeSignedPrekey(id: string, keyPair: naclBoxKeyPair, sig
     secretKey: nacl.encodeBase64(keyPair.secretKey),
     signature: nacl.encodeBase64(signature),
   });
-  await SecureStore.setItemAsync(SIGNED_PREKEY_STORAGE, data);
+  await Storage.setItemAsync(SIGNED_PREKEY_STORAGE, data);
 }
 
 export async function getSignedPrekey(): Promise<{ id: string; keyPair: naclBoxKeyPair; signature: Uint8Array } | null> {
-  const stored = await SecureStore.getItemAsync(SIGNED_PREKEY_STORAGE);
+  const stored = await Storage.getItemAsync(SIGNED_PREKEY_STORAGE);
   if (!stored) return null;
   try {
     const d = JSON.parse(stored);
@@ -90,18 +90,18 @@ export async function storeOneTimePrekey(record: PrekeyRecord) {
     secretKey: nacl.encodeBase64(record.secretKey),
     timestamp: record.timestamp,
   });
-  await SecureStore.setItemAsync(`${OTP_STORAGE_PREFIX}${record.id}`, data);
+  await Storage.setItemAsync(`${OTP_STORAGE_PREFIX}${record.id}`, data);
 }
 
 export async function getOneTimePrekeys(): Promise<PrekeyRecord[]> {
   const keys: PrekeyRecord[] = [];
   // SecureStore doesn't support listing, so we store a manifest
-  const manifest = await SecureStore.getItemAsync(`${OTP_STORAGE_PREFIX}manifest`);
+  const manifest = await Storage.getItemAsync(`${OTP_STORAGE_PREFIX}manifest`);
   if (!manifest) return keys;
   try {
     const ids: string[] = JSON.parse(manifest);
     for (const id of ids) {
-      const stored = await SecureStore.getItemAsync(`${OTP_STORAGE_PREFIX}${id}`);
+      const stored = await Storage.getItemAsync(`${OTP_STORAGE_PREFIX}${id}`);
       if (stored) {
         const d = JSON.parse(stored);
         keys.push({
@@ -120,18 +120,18 @@ export async function setOneTimePrekeys(records: PrekeyRecord[]) {
   // Clear old
   const old = await getOneTimePrekeys();
   for (const r of old) {
-    try { await SecureStore.deleteItemAsync(`${OTP_STORAGE_PREFIX}${r.id}`); } catch {}
+    try { await Storage.deleteItemAsync(`${OTP_STORAGE_PREFIX}${r.id}`); } catch {}
   }
   // Store new
   for (const r of records) {
     await storeOneTimePrekey(r);
   }
   // Update manifest
-  await SecureStore.setItemAsync(`${OTP_STORAGE_PREFIX}manifest`, JSON.stringify(records.map(r => r.id)));
+  await Storage.setItemAsync(`${OTP_STORAGE_PREFIX}manifest`, JSON.stringify(records.map(r => r.id)));
 }
 
 export async function consumeOneTimePrekey(id: string): Promise<naclBoxKeyPair | null> {
-  const stored = await SecureStore.getItemAsync(`${OTP_STORAGE_PREFIX}${id}`);
+  const stored = await Storage.getItemAsync(`${OTP_STORAGE_PREFIX}${id}`);
   if (!stored) return null;
   try {
     const d = JSON.parse(stored);
@@ -140,13 +140,13 @@ export async function consumeOneTimePrekey(id: string): Promise<naclBoxKeyPair |
       secretKey: nacl.decodeBase64(d.secretKey),
     };
     // Remove consumed key
-    await SecureStore.deleteItemAsync(`${OTP_STORAGE_PREFIX}${id}`);
+    await Storage.deleteItemAsync(`${OTP_STORAGE_PREFIX}${id}`);
     // Update manifest
-    const manifest = await SecureStore.getItemAsync(`${OTP_STORAGE_PREFIX}manifest`);
+    const manifest = await Storage.getItemAsync(`${OTP_STORAGE_PREFIX}manifest`);
     if (manifest) {
       const ids: string[] = JSON.parse(manifest);
       const filtered = ids.filter(x => x !== id);
-      await SecureStore.setItemAsync(`${OTP_STORAGE_PREFIX}manifest`, JSON.stringify(filtered));
+      await Storage.setItemAsync(`${OTP_STORAGE_PREFIX}manifest`, JSON.stringify(filtered));
     }
     return keyPair;
   } catch { return null; }
@@ -959,14 +959,14 @@ async function saveSession(chatId: string, session: SessionState) {
     ephemeralPublicKey: session.ephemeralPublicKey ? nacl.encodeBase64(session.ephemeralPublicKey) : null,
   };
 
-  await SecureStore.setItemAsync(
+  await Storage.setItemAsync(
     `${SESSION_PREFIX}${chatId}`,
     JSON.stringify(serializable)
   );
 }
 
 async function loadSession(chatId: string): Promise<SessionState | null> {
-  const stored = await SecureStore.getItemAsync(`${SESSION_PREFIX}${chatId}`);
+  const stored = await Storage.getItemAsync(`${SESSION_PREFIX}${chatId}`);
   if (!stored) return null;
 
   try {
@@ -1045,14 +1045,14 @@ async function saveGroupSession(chatId: string, session: GroupSessionState) {
     members: Array.from(session.members.entries()).map(([k, v]) => [k, nacl.encodeBase64(v)]),
   };
   
-  await SecureStore.setItemAsync(
+  await Storage.setItemAsync(
     `${GROUP_SESSION_PREFIX}${chatId}`,
     JSON.stringify(serializable)
   );
 }
 
 async function loadGroupSession(chatId: string): Promise<GroupSessionState | null> {
-  const stored = await SecureStore.getItemAsync(`${GROUP_SESSION_PREFIX}${chatId}`);
+  const stored = await Storage.getItemAsync(`${GROUP_SESSION_PREFIX}${chatId}`);
   if (!stored) return null;
   
   try {
@@ -1173,12 +1173,12 @@ export async function ensureKeyPair(): Promise<naclBoxKeyPair> {
 }
 
 export async function clearSession(chatId: string) {
-  try { await SecureStore.deleteItemAsync(`${SESSION_PREFIX}${chatId}`); } catch {}
-  try { await SecureStore.deleteItemAsync(`${GROUP_SESSION_PREFIX}${chatId}`); } catch {}
+  try { await Storage.deleteItemAsync(`${SESSION_PREFIX}${chatId}`); } catch {}
+  try { await Storage.deleteItemAsync(`${GROUP_SESSION_PREFIX}${chatId}`); } catch {}
 }
 
 export async function clearAllSessions() {
-  try { await SecureStore.deleteItemAsync(KEYPAIR_STORAGE); } catch {}
+  try { await Storage.deleteItemAsync(KEYPAIR_STORAGE); } catch {}
 }
 
 interface naclBoxKeyPair {

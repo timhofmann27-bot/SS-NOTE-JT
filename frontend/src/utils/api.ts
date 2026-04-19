@@ -113,6 +113,12 @@ export const messagesAPI = {
   getStarred: (chatId: string) => api.get(`/messages/starred/${chatId}`),
   search: (chatId: string, q: string) => api.get(`/messages/search/${chatId}`, { params: { q } }),
   forward: (id: string, chatId: string) => api.post(`/messages/${id}/forward`, { chat_id: chatId }),
+  getMentions: () => api.get('/messages/mentions'),
+  getMentionCount: () => api.get('/messages/mentions/unread-count'),
+  createPoll: (chatId: string, question: string, options: string[]) => api.post(`/chats/${chatId}/polls`, { question, options }),
+  getPolls: (chatId: string) => api.get(`/chats/${chatId}/polls`),
+  getPoll: (pollId: string) => api.get(`/polls/${pollId}`),
+  votePoll: (pollId: string, optionIndex: number) => api.post(`/polls/${pollId}/vote`, { option_index: optionIndex }),
 };
 
 export const typingAPI = {
