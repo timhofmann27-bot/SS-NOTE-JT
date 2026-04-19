@@ -242,6 +242,7 @@ class MessageSend(BaseModel):
     self_destruct_seconds: Optional[int] = Field(default=None, ge=5, le=604800)
     is_emergency: bool = False
     media_base64: Optional[str] = Field(default=None, max_length=5000000)
+    reply_to: Optional[str] = Field(default=None, max_length=50)
     @field_validator('security_level')
     @classmethod
     def validate_sec(cls, v: str) -> str:
@@ -298,6 +299,7 @@ class EncryptedMessageSend(BaseModel):
     media_nonce: Optional[str] = Field(default=None, max_length=100)
     sender_key_id: Optional[str] = Field(default=None, max_length=200)
     sender_key_iteration: Optional[int] = Field(default=None)
+    reply_to: Optional[str] = Field(default=None, max_length=50)
     @field_validator('security_level')
     @classmethod
     def validate_sec(cls, v: str) -> str:
@@ -845,7 +847,7 @@ async def send_message(input: MessageSend, user: dict = Depends(get_current_user
     if not chat:
         raise HTTPException(status_code=404, detail="Chat nicht gefunden")
     now = datetime.now(timezone.utc)
-    msg_doc = {"chat_id": input.chat_id, "sender_id": user["id"], "sender_name": user.get("name", "Unbekannt"), "sender_callsign": user.get("callsign", ""), "content": input.content, "message_type": input.message_type, "security_level": input.security_level, "self_destruct_seconds": input.self_destruct_seconds, "self_destruct_at": (now + timedelta(seconds=input.self_destruct_seconds)) if input.self_destruct_seconds else None, "is_emergency": input.is_emergency, "media_base64": input.media_base64, "status": "sent", "delivered_to": [], "read_by": [user["id"]], "created_at": now, "encrypted": True}
+    msg_doc = {"chat_id": input.chat_id, "sender_id": user["id"], "sender_name": user.get("name", "Unbekannt"), "sender_callsign": user.get("callsign", ""), "content": input.content, "message_type": input.message_type, "security_level": input.security_level, "self_destruct_seconds": input.self_destruct_seconds, "self_destruct_at": (now + timedelta(seconds=input.self_destruct_seconds)) if input.self_destruct_seconds else None, "is_emergency": input.is_emergency, "media_base64": input.media_base64, "reply_to": input.reply_to, "status": "sent", "delivered_to": [], "read_by": [user["id"]], "created_at": now, "encrypted": True}
     result = await db.messages.insert_one(msg_doc)
     preview = input.content[:50] if input.content else "[Medien]"
     if input.is_emergency: preview = "NOTFALL: " + preview
@@ -889,15 +891,70 @@ async def mark_read(input: MessageAck, user: dict = Depends(get_current_user)):
     return {"message": "Nachrichten als gelesen markiert"}
 
 @api_router.delete("/messages/{message_id}")
-async def delete_message(message_id: str, user: dict = Depends(get_current_user)):
+async def delete_message(message_id: str, request: Request, user: dict = Depends(get_current_user)):
+    """Delete message for everyone (within 24h) or for self"""
     oid = validate_object_id(message_id)
     msg = await db.messages.find_one({"_id": oid})
     if not msg:
         raise HTTPException(status_code=404, detail="Nachricht nicht gefunden")
     if msg["sender_id"] != user["id"]:
         raise HTTPException(status_code=403, detail="Nur eigene Nachrichten können gelöscht werden")
-    await db.messages.delete_one({"_id": oid})
+    # Delete for everyone within 24h, otherwise tombstone
+    age_hours = (datetime.now(timezone.utc) - msg["created_at"]).total_seconds() / 3600
+    if age_hours < 24:
+        await db.messages.delete_one({"_id": oid})
+        await ws_emit_to_chat(msg["chat_id"], 'message:deleted', {'message_id': message_id, 'chat_id': msg["chat_id"]})
+    else:
+        await db.messages.update_one({"_id": oid}, {"$set": {"content": "[Nachricht gelöscht]", "deleted": True}})
+    await audit_log("message_deleted", user["id"], request.client.host if request.client else "unknown")
     return {"message": "Nachricht gelöscht"}
+
+class MessageEdit(BaseModel):
+    content: str = Field(min_length=1, max_length=10000)
+
+@api_router.put("/messages/{message_id}")
+async def edit_message(message_id: str, input: MessageEdit, request: Request, user: dict = Depends(get_current_user)):
+    """Edit own message (within 15 min)"""
+    oid = validate_object_id(message_id)
+    msg = await db.messages.find_one({"_id": oid})
+    if not msg:
+        raise HTTPException(status_code=404, detail="Nachricht nicht gefunden")
+    if msg["sender_id"] != user["id"]:
+        raise HTTPException(status_code=403, detail="Nur eigene Nachrichten können bearbeitet werden")
+    age_min = (datetime.now(timezone.utc) - msg["created_at"]).total_seconds() / 60
+    if age_min > 15:
+        raise HTTPException(status_code=400, detail="Nachricht kann nur innerhalb von 15 Minuten bearbeitet werden")
+    await db.messages.update_one({"_id": oid}, {"$set": {"content": input.content, "edited": True, "edited_at": datetime.now(timezone.utc)}})
+    await ws_emit_to_chat(msg["chat_id"], 'message:edited', {'message_id': message_id, 'content': input.content, 'chat_id': msg["chat_id"]})
+    return {"message": "Nachricht bearbeitet"}
+
+class MessageReaction(BaseModel):
+    emoji: str = Field(min_length=1, max_length=10)
+
+@api_router.post("/messages/{message_id}/react")
+async def add_reaction(message_id: str, input: MessageReaction, request: Request, user: dict = Depends(get_current_user)):
+    """Add/remove reaction to a message"""
+    oid = validate_object_id(message_id)
+    msg = await db.messages.find_one({"_id": oid})
+    if not msg:
+        raise HTTPException(status_code=404, detail="Nachricht nicht gefunden")
+    chat = await db.chats.find_one({"_id": ObjectId(msg["chat_id"]), "participant_ids": ObjectId(user["id"])})
+    if not chat:
+        raise HTTPException(status_code=403, detail="Kein Zugriff auf diesen Chat")
+    # Toggle reaction
+    reactions = msg.get("reactions", {})
+    emoji_reactions = reactions.get(input.emoji, [])
+    if user["id"] in emoji_reactions:
+        emoji_reactions.remove(user["id"])
+        if not emoji_reactions:
+            del reactions[input.emoji]
+        else:
+            reactions[input.emoji] = emoji_reactions
+    else:
+        reactions[input.emoji] = emoji_reactions + [user["id"]]
+    await db.messages.update_one({"_id": oid}, {"$set": {"reactions": reactions}})
+    await ws_emit_to_chat(msg["chat_id"], 'message:reaction', {'message_id': message_id, 'reactions': reactions, 'chat_id': msg["chat_id"]})
+    return {"message": "Reaktion aktualisiert", "reactions": reactions}
 
 @api_router.get("/messages/poll/{chat_id}")
 async def poll_messages(chat_id: str, after: Optional[str] = None, user: dict = Depends(get_current_user)):
@@ -1253,6 +1310,7 @@ async def send_encrypted_message(input: EncryptedMessageSend, user: dict = Depen
         "media_nonce": input.media_nonce,
         "sender_key_id": input.sender_key_id,
         "sender_key_iteration": input.sender_key_iteration,
+        "reply_to": input.reply_to,
         "status": "sent",
         "delivered_to": [],
         "read_by": [user["id"]],

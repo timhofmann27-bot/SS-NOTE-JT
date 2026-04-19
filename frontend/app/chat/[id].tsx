@@ -10,6 +10,7 @@ import * as ImagePicker from 'expo-image-picker';
 import * as DocumentPicker from 'expo-document-picker';
 import { useAuth } from '../../src/context/AuthContext';
 import { messagesAPI, chatsAPI, typingAPI, contactsAPI, keysAPI, encryptedMessagesAPI } from '../../src/utils/api';
+import api from '../../src/utils/api';
 import { COLORS, FONTS, SPACING, SECURITY_LEVELS } from '../../src/utils/theme';
 import {
   ensureKeyPair,
@@ -49,6 +50,8 @@ export default function ChatDetailScreen() {
   const [isRecordingVoice, setIsRecordingVoice] = useState(false);
   const [showMediaMenu, setShowMediaMenu] = useState(false);
   const [pendingMedia, setPendingMedia] = useState<{ uri: string; base64: string; type: string; fileName?: string } | null>(null);
+  const [replyTo, setReplyTo] = useState<any>(null);
+  const [messageActions, setMessageActions] = useState<{ msg: any; x: number; y: number } | null>(null);
   const flatListRef = useRef<FlatList>(null);
   const typingTimer = useRef<any>(null);
   const lastMsgId = useRef<string | null>(null);
@@ -250,6 +253,7 @@ export default function ChatDetailScreen() {
               sender_key_iteration: encrypted.iteration,
               security_level: securityLevel,
               self_destruct_seconds: selfDestruct,
+              reply_to: replyTo?.id,
             });
             const msg = res.data.message;
             msg.content = text.trim();
@@ -294,6 +298,7 @@ export default function ChatDetailScreen() {
       }
       setText('');
       setSelfDestruct(null);
+      setReplyTo(null);
     } catch (e) {
       console.log('Error sending message', e);
     } finally {
@@ -653,7 +658,12 @@ export default function ChatDetailScreen() {
             <Text style={[styles.nameSeparatorText, { color: senderColor }]}>{senderName}</Text>
           </View>
         )}
-        <View style={[styles.msgRow, isMine ? styles.msgRowRight : styles.msgRowLeft]}>
+        <TouchableOpacity
+          style={[styles.msgRow, isMine ? styles.msgRowRight : styles.msgRowLeft]}
+          activeOpacity={0.7}
+          onLongPress={() => setMessageActions({ msg: item, x: 0, y: 0 })}
+          delayLongPress={300}
+        >
           {!isMine && chat?.is_group && (
             <View style={[styles.msgAvatar, { backgroundColor: `${senderColor}33` }]}>
               <Text style={[styles.msgAvatarText, { color: senderColor }]}>{getInitial(senderName)}</Text>
@@ -676,6 +686,12 @@ export default function ChatDetailScreen() {
             {item.security_level !== 'UNCLASSIFIED' && (
               <View style={[styles.msgSecBadge, { borderColor: getSecColor(item.security_level) }]}>
                 <Text style={[styles.msgSecText, { color: getSecColor(item.security_level) }]}>{item.security_level}</Text>
+              </View>
+            )}
+            {item.reply_to && (
+              <View style={styles.replyPreview}>
+                <View style={styles.replyPreviewIndicator} />
+                <Text style={styles.replyPreviewText} numberOfLines={1}>Antwort auf {item.reply_to_sender_name || 'Nachricht'}</Text>
               </View>
             )}
             {isVoiceMessage && item.media_base64 ? (
@@ -711,10 +727,21 @@ export default function ChatDetailScreen() {
                 </View>
               )}
               <Text style={styles.msgTime}>{formatTime(item.created_at)}</Text>
+              {item.edited && <Text style={styles.msgEdited}>(bearbeitet)</Text>}
               {statusIcon && <Ionicons name={statusIcon.name as any} size={14} color={statusIcon.color} />}
             </View>
           </View>
-        </View>
+          {item.reactions && Object.keys(item.reactions).length > 0 && (
+            <View style={[styles.msgReactions, isMine ? styles.msgReactionsRight : styles.msgReactionsLeft]}>
+              {Object.entries(item.reactions).map(([emoji, users]: [string, any]) => (
+                <View key={emoji} style={styles.msgReaction}>
+                  <Text style={styles.msgReactionEmoji}>{emoji}</Text>
+                  <Text style={styles.msgReactionCount}>{users.length}</Text>
+                </View>
+              ))}
+            </View>
+          )}
+        </TouchableOpacity>
       </View>
     );
   };
@@ -866,6 +893,63 @@ export default function ChatDetailScreen() {
               <Text style={styles.mediaMenuText}>Abbrechen</Text>
             </TouchableOpacity>
           </View>
+        )}
+
+        {/* Reply bar */}
+        {replyTo && (
+          <View style={styles.replyBar}>
+            <View style={styles.replyIndicator} />
+            <View style={styles.replyContent}>
+              <Text style={styles.replyAuthor}>{replyTo.sender_id === user?.id ? 'Du' : (replyTo.sender_name || 'Unbekannt')}</Text>
+              <Text style={styles.replyText} numberOfLines={1}>{replyTo.content}</Text>
+            </View>
+            <TouchableOpacity onPress={() => setReplyTo(null)}>
+              <Ionicons name="close" size={20} color={COLORS.textMuted} />
+            </TouchableOpacity>
+          </View>
+        )}
+
+        {/* Message context menu */}
+        {messageActions && (
+          <TouchableOpacity style={styles.msgContextMenu} activeOpacity={1} onPress={() => setMessageActions(null)}>
+            <View style={styles.msgContextMenuContent}>
+              <TouchableOpacity style={styles.msgContextMenuItem} onPress={() => { setReplyTo(messageActions.msg); setMessageActions(null); }}>
+                <Ionicons name="return-up-back" size={18} color={COLORS.primaryLight} />
+                <Text style={styles.msgContextMenuItemText}>Antworten</Text>
+              </TouchableOpacity>
+              {messageActions.msg.sender_id === user?.id && (
+                <>
+                  <TouchableOpacity style={styles.msgContextMenuItem} onPress={() => { setMessageActions(null); }}>
+                    <Ionicons name="create" size={18} color={COLORS.primaryLight} />
+                    <Text style={styles.msgContextMenuItemText}>Bearbeiten</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity style={styles.msgContextMenuItem} onPress={async () => {
+                    try {
+                      await api.delete(`/messages/${messageActions.msg.id}`);
+                      setMessages(prev => prev.filter(m => m.id !== messageActions.msg.id));
+                    } catch (e) { console.log(e); }
+                    setMessageActions(null);
+                  }}>
+                    <Ionicons name="trash" size={18} color={COLORS.danger} />
+                    <Text style={[styles.msgContextMenuItemText, { color: COLORS.danger }]}>Löschen</Text>
+                  </TouchableOpacity>
+                </>
+              )}
+              <View style={styles.msgContextReactions}>
+                {['👍', '❤️', '😂', '😮', '😢', '🔥'].map(emoji => (
+                  <TouchableOpacity key={emoji} style={styles.msgContextReactionBtn} onPress={async () => {
+                    try {
+                      await api.post(`/messages/${messageActions.msg.id}/react`, { emoji });
+                      setMessages(prev => prev.map(m => m.id === messageActions.msg.id ? { ...m, reactions: { ...(m.reactions || {}), [emoji]: [...(m.reactions?.[emoji] || []), user?.id] } } : m));
+                    } catch (e) { console.log(e); }
+                    setMessageActions(null);
+                  }}>
+                    <Text style={styles.msgContextReactionEmoji}>{emoji}</Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+            </View>
+          </TouchableOpacity>
         )}
 
         {/* Input */}
@@ -1218,4 +1302,46 @@ const styles = StyleSheet.create({
   mediaPreviewActions: { flexDirection: 'row', gap: 8, marginLeft: 'auto' },
   mediaPreviewCancel: { padding: 8 },
   mediaPreviewSend: { width: 36, height: 36, borderRadius: 18, backgroundColor: COLORS.primary, alignItems: 'center', justifyContent: 'center' },
+
+  // Reply bar
+  replyBar: {
+    flexDirection: 'row', alignItems: 'center', padding: 8, gap: 8,
+    backgroundColor: COLORS.surface, borderTopWidth: 1, borderTopColor: COLORS.border,
+  },
+  replyIndicator: { width: 3, height: 32, backgroundColor: COLORS.primary, borderRadius: 2 },
+  replyContent: { flex: 1 },
+  replyAuthor: { fontSize: FONTS.sizes.xs, fontWeight: FONTS.weights.bold, color: COLORS.primaryLight },
+  replyText: { fontSize: FONTS.sizes.sm, color: COLORS.textSecondary },
+
+  // Message context menu
+  msgContextMenu: {
+    position: 'absolute', top: 0, left: 0, right: 0, bottom: 0,
+    backgroundColor: 'rgba(0,0,0,0.5)', justifyContent: 'center', alignItems: 'center', zIndex: 100,
+  },
+  msgContextMenuContent: {
+    backgroundColor: COLORS.surface, borderRadius: 12, padding: 8, minWidth: 200,
+    borderWidth: 1, borderColor: COLORS.border,
+  },
+  msgContextMenuItem: { flexDirection: 'row', alignItems: 'center', gap: 8, padding: 12 },
+  msgContextMenuItemText: { fontSize: FONTS.sizes.base, color: COLORS.textPrimary },
+  msgContextReactions: { flexDirection: 'row', justifyContent: 'space-around', paddingVertical: 8, borderTopWidth: 1, borderTopColor: COLORS.border, marginTop: 4 },
+  msgContextReactionBtn: { padding: 8 },
+  msgContextReactionEmoji: { fontSize: 20 },
+
+  // Reply preview in message
+  replyPreview: {
+    flexDirection: 'row', alignItems: 'center', gap: 4, marginBottom: 4,
+    paddingLeft: 4, borderLeftWidth: 2, borderLeftColor: COLORS.primary,
+  },
+  replyPreviewIndicator: { width: 2, height: 16, backgroundColor: COLORS.primary, borderRadius: 1 },
+  replyPreviewText: { fontSize: FONTS.sizes.xs, color: COLORS.textMuted, flex: 1 },
+
+  // Message reactions
+  msgReactions: { flexDirection: 'row', gap: 4, marginTop: 2, position: 'absolute', bottom: -12 },
+  msgReactionsLeft: { left: 0 },
+  msgReactionsRight: { right: 0 },
+  msgReaction: { flexDirection: 'row', alignItems: 'center', backgroundColor: COLORS.surface, borderRadius: 10, paddingHorizontal: 6, paddingVertical: 2, borderWidth: 1, borderColor: COLORS.border },
+  msgReactionEmoji: { fontSize: 12 },
+  msgReactionCount: { fontSize: 10, color: COLORS.textMuted, marginLeft: 2 },
+  msgEdited: { fontSize: 9, color: COLORS.textMuted, fontStyle: 'italic' },
 });
