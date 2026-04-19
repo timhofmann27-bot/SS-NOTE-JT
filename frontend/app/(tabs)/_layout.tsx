@@ -4,15 +4,10 @@ import { Ionicons } from '@expo/vector-icons';
 import { COLORS, FONTS } from '../../src/utils/theme';
 import { View, Text, StyleSheet } from 'react-native';
 import BiometricLock from '../../src/components/BiometricLock';
-import * as SecureStore from 'expo-secure-store';
-import { useState, useEffect } from 'react';
-
-export default function TabLayout() {
-  const [biometricEnabled, setBiometricEnabled] = useState(false);
-  const [loading, setLoading] = useState(true);
+import Storage from '../../src/utils/Storage';
 
   useEffect(() => {
-    SecureStore.getItemAsync('biometric_lock').then(val => {
+    Storage.getItemAsync('biometric_lock').then(val => {
       setBiometricEnabled(val === 'true');
       setLoading(false);
     }).catch(() => setLoading(false));

@@ -1,6 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { View, Text, TouchableOpacity, StyleSheet, Platform } from 'react-native';
-import { Audio } from 'expo-av';
 import { Ionicons } from '@expo/vector-icons';
 import { COLORS, FONTS } from '../utils/theme';
 
@@ -14,13 +13,21 @@ export default function VoiceMessagePlayer({ audioBase64, durationMs, isMine }: 
   const [isPlaying, setIsPlaying] = useState(false);
   const [progress, setProgress] = useState(0);
   const [duration, setDuration] = useState(durationMs || 0);
-  const soundRef = useRef<Audio.Sound | null>(null);
+
+  // Native ref
+  const soundRef = useRef<any>(null);
+  // Web ref
+  const audioElRef = useRef<HTMLAudioElement | null>(null);
   const progressTimer = useRef<any>(null);
 
   useEffect(() => {
     return () => {
       if (soundRef.current) {
-        soundRef.current.unloadAsync().catch(() => {});
+        soundRef.current.unloadAsync?.().catch(() => {});
+      }
+      if (audioElRef.current) {
+        audioElRef.current.pause();
+        audioElRef.current.src = '';
       }
       if (progressTimer.current) clearInterval(progressTimer.current);
     };
@@ -36,23 +43,53 @@ export default function VoiceMessagePlayer({ audioBase64, durationMs, isMine }: 
   const loadAndPlay = async () => {
     try {
       if (isPlaying) {
-        if (soundRef.current) {
-          await soundRef.current.pauseAsync();
-          setIsPlaying(false);
+        if (Platform.OS === 'web') {
+          audioElRef.current?.pause();
+        } else {
+          await soundRef.current?.pauseAsync();
         }
+        setIsPlaying(false);
         return;
       }
 
-      if (!soundRef.current) {
-        const base64Uri = `data:audio/mp4;base64,${audioBase64}`;
-        const { sound } = await Audio.Sound.createAsync(
-          { uri: base64Uri },
-          { shouldPlay: true },
-          onPlaybackStatusUpdate
-        );
-        soundRef.current = sound;
+      if (Platform.OS === 'web') {
+        if (!audioElRef.current) {
+          const base64Uri = `data:audio/mp4;base64,${audioBase64}`;
+          const audio = new Audio(base64Uri);
+          audioElRef.current = audio;
+
+          audio.addEventListener('timeupdate', () => {
+            setProgress(audio.currentTime * 1000);
+          });
+          audio.addEventListener('loadedmetadata', () => {
+            setDuration(audio.duration * 1000);
+          });
+          audio.addEventListener('ended', () => {
+            setIsPlaying(false);
+            setProgress(0);
+          });
+          audio.addEventListener('error', (e) => {
+            console.error('Audio playback error', e);
+            setIsPlaying(false);
+          });
+
+          await audio.play();
+        } else {
+          await audioElRef.current.play();
+        }
       } else {
-        await soundRef.current.playAsync();
+        if (!soundRef.current) {
+          const { Audio } = await import('expo-av');
+          const base64Uri = `data:audio/mp4;base64,${audioBase64}`;
+          const { sound } = await Audio.Sound.createAsync(
+            { uri: base64Uri },
+            { shouldPlay: true },
+            onPlaybackStatusUpdate
+          );
+          soundRef.current = sound;
+        } else {
+          await soundRef.current.playAsync();
+        }
       }
       setIsPlaying(true);
     } catch (err) {
@@ -97,7 +134,7 @@ export default function VoiceMessagePlayer({ audioBase64, durationMs, isMine }: 
       </View>
 
       <View style={styles.waveformIcon}>
-        <Ionicons name="waveform" size={20} color={isMine ? 'rgba(255,255,255,0.5)' : COLORS.textMuted} />
+        <Ionicons name="musical-notes" size={20} color={isMine ? 'rgba(255,255,255,0.5)' : COLORS.textMuted} />
       </View>
     </View>
   );

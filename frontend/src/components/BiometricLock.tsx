@@ -1,8 +1,20 @@
 import React, { useState, useEffect } from 'react';
-import { View, Text, StyleSheet, TouchableOpacity, ActivityIndicator } from 'react-native';
-import * as LocalAuthentication from 'expo-local-authentication';
+import { View, Text, StyleSheet, TouchableOpacity, ActivityIndicator, TextInput, Platform } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { COLORS, FONTS } from '../utils/theme';
+import Storage from '../utils/Storage';
+
+const WEB_PIN_KEY = 'web_pin_hash';
+
+function hashPin(pin: string): string {
+  let hash = 0;
+  for (let i = 0; i < pin.length; i++) {
+    const char = pin.charCodeAt(i);
+    hash = ((hash << 5) - hash) + char;
+    hash = hash & hash;
+  }
+  return hash.toString(36);
+}
 
 interface BiometricLockProps {
   children: React.ReactNode;
@@ -13,6 +25,8 @@ export default function BiometricLock({ children, enabled }: BiometricLockProps)
   const [isAuthenticated, setIsAuthenticated] = useState(!enabled);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [pinInput, setPinInput] = useState('');
+  const [isSetup, setIsSetup] = useState(false);
 
   useEffect(() => {
     if (!enabled) {
@@ -21,8 +35,20 @@ export default function BiometricLock({ children, enabled }: BiometricLockProps)
       return;
     }
 
+    if (Platform.OS === 'web') {
+      (async () => {
+        const stored = await Storage.getItemAsync(WEB_PIN_KEY);
+        if (stored) {
+          setIsSetup(true);
+        }
+        setIsLoading(false);
+      })();
+      return;
+    }
+
     const authenticate = async () => {
       try {
+        const LocalAuthentication = await import('expo-local-authentication');
         const hasHardware = await LocalAuthentication.hasHardwareAsync();
         const isEnrolled = await LocalAuthentication.isEnrolledAsync();
 
@@ -56,7 +82,14 @@ export default function BiometricLock({ children, enabled }: BiometricLockProps)
   const handleRetry = async () => {
     setError(null);
     setIsLoading(true);
+
+    if (Platform.OS === 'web') {
+      setIsLoading(false);
+      return;
+    }
+
     try {
+      const LocalAuthentication = await import('expo-local-authentication');
       const result = await LocalAuthentication.authenticateAsync({
         promptMessage: 'SS-Note entsperren',
         fallbackLabel: 'Abbrechen',
@@ -74,6 +107,30 @@ export default function BiometricLock({ children, enabled }: BiometricLockProps)
     }
   };
 
+  const handlePinSubmit = async () => {
+    if (pinInput.length < 4) {
+      setError('PIN muss mindestens 4 Ziffern haben');
+      return;
+    }
+
+    const hashed = hashPin(pinInput);
+
+    if (isSetup) {
+      const stored = await Storage.getItemAsync(WEB_PIN_KEY);
+      if (hashed === stored) {
+        setIsAuthenticated(true);
+        setPinInput('');
+      } else {
+        setError('Falsche PIN');
+      }
+    } else {
+      await Storage.setItemAsync(WEB_PIN_KEY, hashed);
+      setIsSetup(true);
+      setIsAuthenticated(true);
+      setPinInput('');
+    }
+  };
+
   if (!enabled || isAuthenticated) {
     return <>{children}</>;
   }
@@ -83,6 +140,40 @@ export default function BiometricLock({ children, enabled }: BiometricLockProps)
       <View style={styles.container}>
         <ActivityIndicator size="large" color={COLORS.primaryLight} />
         <Text style={styles.loadingText}>Entsperren...</Text>
+      </View>
+    );
+  }
+
+  if (Platform.OS === 'web') {
+    return (
+      <View style={styles.container}>
+        <View style={styles.lockIcon}>
+          <Ionicons name="lock-closed" size={48} color={COLORS.primaryLight} />
+        </View>
+        <Text style={styles.title}>SS-Note ist gesperrt</Text>
+        <Text style={styles.subtitle}>{isSetup ? 'Gib deine PIN ein' : 'Erstelle eine PIN zum Entsperren'}</Text>
+
+        {error && <Text style={styles.error}>{error}</Text>}
+
+        <TextInput
+          style={styles.pinInput}
+          value={pinInput}
+          onChangeText={setPinInput}
+          placeholder="4-stellige PIN"
+          placeholderTextColor={COLORS.textMuted}
+          keyboardType="number-pad"
+          maxLength={6}
+          secureTextEntry
+          onSubmitEditing={handlePinSubmit}
+          autoFocus
+        />
+
+        <View style={styles.buttonRow}>
+          <TouchableOpacity style={styles.retryBtn} onPress={handlePinSubmit}>
+            <Ionicons name={isSetup ? 'unlock' : 'key'} size={20} color={COLORS.white} />
+            <Text style={styles.retryBtnText}>{isSetup ? 'Entsperren' : 'PIN erstellen'}</Text>
+          </TouchableOpacity>
+        </View>
       </View>
     );
   }
@@ -117,4 +208,5 @@ const styles = StyleSheet.create({
   buttonRow: { flexDirection: 'row', gap: 12 },
   retryBtn: { flexDirection: 'row', alignItems: 'center', gap: 8, backgroundColor: COLORS.primary, paddingHorizontal: 24, paddingVertical: 12, borderRadius: 12 },
   retryBtnText: { fontSize: FONTS.sizes.base, color: COLORS.white, fontWeight: FONTS.weights.bold },
+  pinInput: { backgroundColor: COLORS.surface, borderRadius: 12, borderWidth: 1, borderColor: COLORS.border, paddingHorizontal: 24, height: 56, color: COLORS.textPrimary, fontSize: FONTS.sizes.xl, fontWeight: FONTS.weights.bold, textAlign: 'center', letterSpacing: 12, width: 200, marginBottom: 16 },
 });

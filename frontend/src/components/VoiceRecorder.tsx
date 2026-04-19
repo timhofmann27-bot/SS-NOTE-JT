@@ -2,7 +2,6 @@ import React, { useState, useRef, useEffect, useCallback } from 'react';
 import {
   View, Text, TouchableOpacity, StyleSheet, Animated, Dimensions, Platform
 } from 'react-native';
-import { Audio } from 'expo-av';
 import { Ionicons } from '@expo/vector-icons';
 import { COLORS, FONTS } from '../utils/theme';
 
@@ -14,29 +13,73 @@ interface VoiceRecorderProps {
 }
 
 export default function VoiceRecorder({ onSend, onCancel }: VoiceRecorderProps) {
-  const [recording, setRecording] = useState<Audio.Recording | null>(null);
   const [isRecording, setIsRecording] = useState(false);
   const [duration, setDuration] = useState(0);
   const [waveform, setWaveform] = useState<number[]>(Array(30).fill(0.1));
+  const [error, setError] = useState<string | null>(null);
 
   const timerRef = useRef<any>(null);
   const animValue = useRef(new Animated.Value(0)).current;
   const waveformInterval = useRef<any>(null);
 
+  // Native refs
+  const recordingRef = useRef<any>(null);
+
+  // Web refs
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const chunksRef = useRef<Blob[]>([]);
+  const streamRef = useRef<MediaStream | null>(null);
+  const startTimeRef = useRef<number>(0);
+
   const startRecording = async () => {
+    setError(null);
     try {
-      const permission = await Audio.requestPermissionsAsync();
-      if (permission.status !== 'granted') return;
+      if (Platform.OS === 'web') {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        streamRef.current = stream;
 
-      await Audio.setAudioModeAsync({
-        allowsRecordingIOS: true,
-        playsInSilentModeIOS: true,
-      });
+        const mimeType = MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm'
+          : MediaRecorder.isTypeSupported('audio/ogg') ? 'audio/ogg'
+          : 'audio/mp4';
 
-      const { recording: newRecording } = await Audio.Recording.createAsync(
-        Audio.RecordingOptionsPresets.HIGH_QUALITY
-      );
-      setRecording(newRecording);
+        const mediaRecorder = new MediaRecorder(stream, { mimeType });
+        mediaRecorderRef.current = mediaRecorder;
+        chunksRef.current = [];
+
+        mediaRecorder.ondataavailable = (e) => {
+          if (e.data.size > 0) chunksRef.current.push(e.data);
+        };
+
+        mediaRecorder.onstop = async () => {
+          const blob = new Blob(chunksRef.current, { type: mimeType });
+          const reader = new FileReader();
+          reader.readAsDataURL(blob);
+          reader.onloadend = () => {
+            const base64 = (reader.result as string).split(',')[1];
+            const durationMs = Date.now() - startTimeRef.current;
+            onSend(base64, durationMs);
+          };
+          stream.getTracks().forEach(t => t.stop());
+        };
+
+        mediaRecorder.start();
+        startTimeRef.current = Date.now();
+      } else {
+        const { Audio } = await import('expo-av');
+        const permission = await Audio.requestPermissionsAsync();
+        if (permission.status !== 'granted') return;
+
+        await Audio.setAudioModeAsync({
+          allowsRecordingIOS: true,
+          playsInSilentModeIOS: true,
+        });
+
+        const { recording } = await Audio.Recording.createAsync(
+          Audio.RecordingOptionsPresets.HIGH_QUALITY
+        );
+        recordingRef.current = recording;
+      }
+
       setIsRecording(true);
       setDuration(0);
 
@@ -57,7 +100,8 @@ export default function VoiceRecorder({ onSend, onCancel }: VoiceRecorderProps) 
           Animated.timing(animValue, { toValue: 0, duration: 800, useNativeDriver: true }),
         ])
       ).start();
-    } catch (err) {
+    } catch (err: any) {
+      setError(err.message || 'Mikrofon nicht verfügbar');
       console.error('Failed to start recording', err);
     }
   };
@@ -68,25 +112,30 @@ export default function VoiceRecorder({ onSend, onCancel }: VoiceRecorderProps) 
       if (waveformInterval.current) clearInterval(waveformInterval.current);
       animValue.stopAnimation();
 
-      if (!recording) return;
+      if (Platform.OS === 'web') {
+        if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+          mediaRecorderRef.current.stop();
+        }
+      } else {
+        if (!recordingRef.current) return;
+        await recordingRef.current.stopAndUnloadAsync();
+        const uri = recordingRef.current.getURI();
+        const durationMs = duration;
+        recordingRef.current = null;
 
-      await recording.stopAndUnloadAsync();
-      const uri = recording.getURI();
-      const durationMs = duration;
-
-      setRecording(null);
-      setIsRecording(false);
-
-      if (uri) {
-        const response = await fetch(uri);
-        const blob = await response.blob();
-        const reader = new FileReader();
-        reader.readAsDataURL(blob);
-        reader.onloadend = () => {
-          const base64 = (reader.result as string).split(',')[1];
-          onSend(base64, durationMs);
-        };
+        if (uri) {
+          const response = await fetch(uri);
+          const blob = await response.blob();
+          const reader = new FileReader();
+          reader.readAsDataURL(blob);
+          reader.onloadend = () => {
+            const base64 = (reader.result as string).split(',')[1];
+            onSend(base64, durationMs);
+          };
+        }
       }
+
+      setIsRecording(false);
     } catch (err) {
       console.error('Failed to stop recording', err);
       onCancel();
@@ -99,10 +148,21 @@ export default function VoiceRecorder({ onSend, onCancel }: VoiceRecorderProps) 
       if (waveformInterval.current) clearInterval(waveformInterval.current);
       animValue.stopAnimation();
 
-      if (recording) {
-        await recording.stopAndUnloadAsync();
-        setRecording(null);
+      if (Platform.OS === 'web') {
+        if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+          mediaRecorderRef.current.stop();
+        }
+        if (streamRef.current) {
+          streamRef.current.getTracks().forEach(t => t.stop());
+        }
+        chunksRef.current = [];
+      } else {
+        if (recordingRef.current) {
+          await recordingRef.current.stopAndUnloadAsync();
+          recordingRef.current = null;
+        }
       }
+
       setIsRecording(false);
       onCancel();
     } catch (err) {
@@ -114,7 +174,16 @@ export default function VoiceRecorder({ onSend, onCancel }: VoiceRecorderProps) 
     return () => {
       if (timerRef.current) clearInterval(timerRef.current);
       if (waveformInterval.current) clearInterval(waveformInterval.current);
-      if (recording) recording.stopAndUnloadAsync().catch(() => {});
+      if (Platform.OS === 'web') {
+        if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+          mediaRecorderRef.current.stop();
+        }
+        if (streamRef.current) {
+          streamRef.current.getTracks().forEach(t => t.stop());
+        }
+      } else {
+        if (recordingRef.current) recordingRef.current.stopAndUnloadAsync().catch(() => {});
+      }
     };
   }, []);
 
@@ -157,6 +226,7 @@ export default function VoiceRecorder({ onSend, onCancel }: VoiceRecorderProps) 
         </View>
 
         <Text style={styles.duration}>{formatDuration(duration)}</Text>
+        {error && <Text style={styles.errorText}>{error}</Text>}
       </View>
 
       <View style={styles.controls}>
@@ -171,7 +241,7 @@ export default function VoiceRecorder({ onSend, onCancel }: VoiceRecorderProps) 
           disabled={!isRecording}
         >
           <Ionicons name="send" size={24} color={COLORS.white} />
-          <Text style={styles.sendText}>{isRecording ? 'Loslassen zum Senden' : 'Senden'}</Text>
+          <Text style={styles.sendText}>{isRecording ? 'Senden' : 'Senden'}</Text>
         </TouchableOpacity>
       </View>
     </View>
@@ -216,6 +286,11 @@ const styles = StyleSheet.create({
     fontWeight: FONTS.weights.bold,
     color: COLORS.textPrimary,
     fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
+  },
+  errorText: {
+    fontSize: FONTS.sizes.sm,
+    color: COLORS.danger,
+    marginTop: 8,
   },
   controls: {
     flexDirection: 'row',

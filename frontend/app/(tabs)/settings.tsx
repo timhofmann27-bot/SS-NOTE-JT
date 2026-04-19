@@ -1,15 +1,11 @@
-import React, { useState, useEffect } from 'react';
-import { View, Text, TouchableOpacity, StyleSheet, ScrollView, TextInput, Alert, ActivityIndicator, Image, Switch, Modal } from 'react-native';
+import React, { useState, useEffect, useRef } from 'react';
+import { View, Text, TouchableOpacity, StyleSheet, ScrollView, TextInput, Alert, ActivityIndicator, Image, Switch, Modal, Platform } from 'react-native';
 import { useRouter } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
 import { useAuth } from '../../src/context/AuthContext';
 import { profileAPI, authAPI, contactsAPI, chatsAPI } from '../../src/utils/api';
 import { COLORS, FONTS, SPACING, ROLES } from '../../src/utils/theme';
-import * as SecureStore from 'expo-secure-store';
-import * as LocalAuthentication from 'expo-local-authentication';
-import * as Sharing from 'expo-sharing';
-import { File, Paths } from 'expo-file-system';
-import * as FileSystem from 'expo-file-system/legacy';
+import Storage from '../../src/utils/Storage';
 import nacl from 'tweetnacl';
 import * as naclUtil from 'tweetnacl-util';
 
@@ -53,12 +49,16 @@ export default function SettingsScreen() {
   const [backupPasswordConfirm, setBackupPasswordConfirm] = useState('');
 
   useEffect(() => {
-    SecureStore.getItemAsync('biometric_lock').then(val => {
+    Storage.getItemAsync('biometric_lock').then(val => {
       setBiometricEnabled(val === 'true');
     });
-    LocalAuthentication.hasHardwareAsync().then(has => {
-      if (has) LocalAuthentication.isEnrolledAsync().then(enrolled => setBiometricAvailable(has && enrolled));
-    });
+    if (Platform.OS !== 'web') {
+      import('expo-local-authentication').then(LocalAuthentication => {
+        LocalAuthentication.hasHardwareAsync().then(has => {
+          if (has) LocalAuthentication.isEnrolledAsync().then(enrolled => setBiometricAvailable(has && enrolled));
+        });
+      });
+    }
   }, []);
 
   const handleSave = async () => {
@@ -158,12 +158,27 @@ export default function SettingsScreen() {
         created_at: new Date().toISOString(),
       });
 
-      const file = new File(Paths.document, `${chatName || 'chat'}_backup.enc.json`);
-      await file.write(backupPayload);
-      if (await Sharing.isAvailableAsync()) {
-        await Sharing.shareAsync(file.uri);
+      if (Platform.OS === 'web') {
+        const blob = new Blob([backupPayload], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `${chatName || 'chat'}_backup.enc.json`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        Alert.alert('Exportiert', 'Verschlüsseltes Backup heruntergeladen');
       } else {
-        Alert.alert('Exportiert', `Verschlüsseltes Backup gespeichert unter: ${file.uri}`);
+        const { File, Paths } = await import('expo-file-system');
+        const { isAvailableAsync, shareAsync } = await import('expo-sharing');
+        const file = new File(Paths.document, `${chatName || 'chat'}_backup.enc.json`);
+        await file.write(backupPayload);
+        if (await isAvailableAsync()) {
+          await shareAsync(file.uri);
+        } else {
+          Alert.alert('Exportiert', `Verschlüsseltes Backup gespeichert unter: ${file.uri}`);
+        }
       }
     } catch (e: any) {
       Alert.alert('Fehler', e?.response?.data?.detail || 'Export fehlgeschlagen');
@@ -172,14 +187,15 @@ export default function SettingsScreen() {
     }
   };
 
-  const handleImportBackup = async (fileUri: string) => {
+  const importFileRef = useRef<HTMLInputElement | null>(null);
+
+  const handleImportBackup = async (content: string) => {
     if (!importPassword) {
       Alert.alert('Fehler', 'Gib dein Backup-Passwort ein');
       return;
     }
     setImporting(true);
     try {
-      const content = await FileSystem.readAsStringAsync(fileUri);
       const payload = JSON.parse(content);
       if (payload.type !== 'encrypted_backup') {
         Alert.alert('Fehler', 'Ungültiges Backup-Format');
@@ -204,6 +220,32 @@ export default function SettingsScreen() {
       Alert.alert('Fehler', 'Import fehlgeschlagen: ' + (e.message || 'Unbekannter Fehler'));
     } finally {
       setImporting(false);
+    }
+  };
+
+  const handleImportFileSelect = async () => {
+    if (Platform.OS === 'web') {
+      const input = document.createElement('input');
+      input.type = 'file';
+      input.accept = '.enc.json,.json';
+      input.onchange = async (e: any) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = async (ev) => {
+          await handleImportBackup(ev.target?.result as string);
+        };
+        reader.readAsText(file);
+      };
+      input.click();
+    } else {
+      const { DocumentPicker } = await import('expo-document-picker');
+      const result = await DocumentPicker.getDocumentAsync({ type: 'application/json' });
+      if (!result.canceled && result.assets[0]) {
+        const { readAsStringAsync } = await import('expo-file-system/legacy');
+        const content = await readAsStringAsync(result.assets[0].uri);
+        await handleImportBackup(content);
+      }
     }
   };
 
@@ -264,7 +306,7 @@ export default function SettingsScreen() {
                   <Switch
                     value={biometricEnabled}
                     onValueChange={async (val) => {
-                      await SecureStore.setItemAsync('biometric_lock', val ? 'true' : 'false');
+                      await Storage.setItemAsync('biometric_lock', val ? 'true' : 'false');
                       setBiometricEnabled(val);
                     }}
                     trackColor={{ false: COLORS.textMuted, true: COLORS.primary }}
@@ -487,9 +529,7 @@ export default function SettingsScreen() {
               />
               <TouchableOpacity
                 style={[styles.importBtn, importing && { opacity: 0.5 }]}
-                onPress={() => {
-                  Alert.alert('Datei auswählen', 'Wähle eine .enc.json Backup-Datei aus deinem Dateimanager.');
-                }}
+                onPress={handleImportFileSelect}
                 disabled={importing}
               >
                 <Ionicons name="folder-open-outline" size={20} color={COLORS.white} />

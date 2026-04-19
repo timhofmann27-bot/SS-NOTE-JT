@@ -473,58 +473,108 @@ export default function ChatDetailScreen() {
 
   const pickImage = async () => {
     setShowMediaMenu(false);
-    const result = await ImagePicker.launchImageLibraryAsync({
-      mediaTypes: ImagePicker.MediaTypeOptions.Images,
-      allowsEditing: false,
-      quality: 0.8,
-      base64: true,
-    });
-    if (!result.canceled && result.assets[0]) {
-      setPendingMedia({
-        uri: result.assets[0].uri,
-        base64: result.assets[0].base64 || '',
-        type: 'image',
+    if (Platform.OS === 'web') {
+      const input = document.createElement('input');
+      input.type = 'file';
+      input.accept = 'image/*';
+      input.onchange = async (e: any) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.readAsDataURL(file);
+        reader.onloadend = () => {
+          const base64 = (reader.result as string).split(',')[1];
+          setPendingMedia({ uri: URL.createObjectURL(file), base64, type: 'image' });
+        };
+      };
+      input.click();
+    } else {
+      const result = await ImagePicker.launchImageLibraryAsync({
+        mediaTypes: ImagePicker.MediaTypeOptions.Images,
+        allowsEditing: false,
+        quality: 0.8,
+        base64: true,
       });
+      if (!result.canceled && result.assets[0]) {
+        setPendingMedia({
+          uri: result.assets[0].uri,
+          base64: result.assets[0].base64 || '',
+          type: 'image',
+        });
+      }
     }
   };
 
   const pickVideo = async () => {
     setShowMediaMenu(false);
-    const result = await ImagePicker.launchImageLibraryAsync({
-      mediaTypes: ImagePicker.MediaTypeOptions.Videos,
-      allowsEditing: false,
-      quality: 0.7,
-      base64: true,
-    });
-    if (!result.canceled && result.assets[0]) {
-      setPendingMedia({
-        uri: result.assets[0].uri,
-        base64: result.assets[0].base64 || '',
-        type: 'video',
+    if (Platform.OS === 'web') {
+      const input = document.createElement('input');
+      input.type = 'file';
+      input.accept = 'video/*';
+      input.onchange = async (e: any) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.readAsDataURL(file);
+        reader.onloadend = () => {
+          const base64 = (reader.result as string).split(',')[1];
+          setPendingMedia({ uri: URL.createObjectURL(file), base64, type: 'video' });
+        };
+      };
+      input.click();
+    } else {
+      const result = await ImagePicker.launchImageLibraryAsync({
+        mediaTypes: ImagePicker.MediaTypeOptions.Videos,
+        allowsEditing: false,
+        quality: 0.7,
+        base64: true,
       });
+      if (!result.canceled && result.assets[0]) {
+        setPendingMedia({
+          uri: result.assets[0].uri,
+          base64: result.assets[0].base64 || '',
+          type: 'video',
+        });
+      }
     }
   };
 
   const pickFile = async () => {
     setShowMediaMenu(false);
-    const result = await DocumentPicker.getDocumentAsync({
-      copyToCacheDirectory: true,
-    });
-    if (!result.canceled && result.assets[0]) {
-      const file = result.assets[0];
-      const response = await fetch(file.uri);
-      const blob = await response.blob();
-      const reader = new FileReader();
-      reader.readAsDataURL(blob);
-      reader.onloadend = () => {
-        const base64 = (reader.result as string).split(',')[1];
-        setPendingMedia({
-          uri: file.uri,
-          base64,
-          type: 'file',
-          fileName: file.name,
-        });
+    if (Platform.OS === 'web') {
+      const input = document.createElement('input');
+      input.type = 'file';
+      input.onchange = async (e: any) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.readAsDataURL(file);
+        reader.onloadend = () => {
+          const base64 = (reader.result as string).split(',')[1];
+          setPendingMedia({ uri: URL.createObjectURL(file), base64, type: 'file', fileName: file.name });
+        };
       };
+      input.click();
+    } else {
+      const result = await DocumentPicker.getDocumentAsync({
+        copyToCacheDirectory: true,
+      });
+      if (!result.canceled && result.assets[0]) {
+        const file = result.assets[0];
+        const response = await fetch(file.uri);
+        const blob = await response.blob();
+        const reader = new FileReader();
+        reader.readAsDataURL(blob);
+        reader.onloadend = () => {
+          const base64 = (reader.result as string).split(',')[1];
+          setPendingMedia({
+            uri: file.uri,
+            base64,
+            type: 'file',
+            fileName: file.name,
+          });
+        };
+      }
     }
   };
 
