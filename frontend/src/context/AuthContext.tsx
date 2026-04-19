@@ -1,5 +1,5 @@
 import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
-import { authAPI, keysAPI, pushAPI, setAuthToken, connectSocket, disconnectSocket } from '../utils/api';
+import { authAPI, keysAPI, pushAPI, setAuthToken } from '../utils/api';
 import { ensureKeyPair, getKeyFingerprint } from '../utils/crypto';
 import * as Notifications from 'expo-notifications';
 import { Platform } from 'react-native';
@@ -56,7 +56,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   const refreshUser = useCallback(async () => {
     try { const res = await authAPI.me(); setUser(res.data.user); }
-    catch { setUser(null); setAuthToken(null); disconnectSocket(); }
+    catch { setUser(null); setAuthToken(null); }
   }, []);
 
   useEffect(() => {
@@ -67,11 +67,26 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     })();
   }, []);
 
+  // Listen for session expired events (triggered when refresh fails)
+  useEffect(() => {
+    const handleSessionExpired = () => {
+      setUser(null);
+      setLoading(false);
+    };
+
+    if (typeof window !== 'undefined') {
+      window.addEventListener('auth:session_expired', handleSessionExpired);
+      return () => {
+        window.removeEventListener('auth:session_expired', handleSessionExpired);
+      };
+    }
+  }, []);
+
   const login = async (username: string, passkey: string) => {
     const res = await authAPI.login({ username, passkey });
     setAuthToken(res.data.token);
+    (global as any).__authToken = res.data.token;
     setUser(res.data.user);
-    try { connectSocket(res.data.token); } catch {}
     try {
       const keyPair = await ensureKeyPair();
       const fingerprint = getKeyFingerprint(keyPair.publicKey);
@@ -88,8 +103,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const register = async (username: string, passkey: string, name: string, callsign?: string) => {
     const res = await authAPI.register({ username, passkey, name, callsign });
     setAuthToken(res.data.token);
+    (global as any).__authToken = res.data.token;
     setUser(res.data.user);
-    try { connectSocket(res.data.token); } catch {}
     try {
       const keyPair = await ensureKeyPair();
       const fingerprint = getKeyFingerprint(keyPair.publicKey);
@@ -106,8 +121,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const logout = async () => {
     try { await authAPI.logout(); } catch {}
     try { await pushAPI.unregister(); } catch {}
-    disconnectSocket();
     setAuthToken(null);
+    (global as any).__authToken = null;
     setUser(null);
   };
 

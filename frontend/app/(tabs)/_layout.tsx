@@ -1,10 +1,14 @@
-import React from 'react';
+import React, { useState, useEffect } from 'react';
 import { Tabs } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
 import { COLORS, FONTS } from '../../src/utils/theme';
 import { View, Text, StyleSheet } from 'react-native';
 import BiometricLock from '../../src/components/BiometricLock';
 import Storage from '../../src/utils/Storage';
+
+export default function TabsLayout() {
+  const [biometricEnabled, setBiometricEnabled] = useState(false);
+  const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     Storage.getItemAsync('biometric_lock').then(val => {

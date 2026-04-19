@@ -9,10 +9,9 @@ import { Ionicons } from '@expo/vector-icons';
 import * as ImagePicker from 'expo-image-picker';
 import * as DocumentPicker from 'expo-document-picker';
 import * as Location from 'expo-location';
-import { Platform } from 'react-native';
 import { useAuth } from '../../src/context/AuthContext';
-import { messagesAPI, chatsAPI, typingAPI, contactsAPI, keysAPI, encryptedMessagesAPI } from '../../src/utils/api';
-import api from '../../src/utils/api';
+import { useChat } from '../../src/context/ChatContext';
+import api, { messagesAPI, chatsAPI, typingAPI, contactsAPI, keysAPI, encryptedMessagesAPI, getSocket, emitTyping, emitStopTyping } from '../../src/utils/api';
 import { COLORS, FONTS, SPACING, SECURITY_LEVELS } from '../../src/utils/theme';
 import {
   ensureKeyPair,
@@ -33,13 +32,13 @@ import nacl from 'tweetnacl';
 export default function ChatDetailScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
   const { user } = useAuth();
+  const { typingUsers: wsTypingUsers } = useChat();
   const router = useRouter();
   const [chat, setChat] = useState<any>(null);
   const [messages, setMessages] = useState<any[]>([]);
   const [text, setText] = useState('');
   const [loading, setLoading] = useState(true);
   const [sending, setSending] = useState(false);
-  const [typingUsers, setTypingUsers] = useState<any[]>([]);
   const [securityLevel, setSecurityLevel] = useState('UNCLASSIFIED');
   const [showSecMenu, setShowSecMenu] = useState(false);
   const [selfDestruct, setSelfDestruct] = useState<number | null>(null);
@@ -67,10 +66,12 @@ export default function ChatDetailScreen() {
   const [showVerifyModal, setShowVerifyModal] = useState(false);
   const [contactVerified, setContactVerified] = useState(false);
   const [sendingLocation, setSendingLocation] = useState(false);
+  const [wsConnected, setWsConnected] = useState(false);
   const flatListRef = useRef<FlatList>(null);
   const typingTimer = useRef<any>(null);
   const lastMsgId = useRef<string | null>(null);
   const e2eeSessionRef = useRef<boolean>(false);
+  const processedMsgIds = useRef<Set<string>>(new Set());
 
   const loadChat = useCallback(async () => {
     if (!id) return;
@@ -124,6 +125,7 @@ export default function ChatDetailScreen() {
       
       if (msgsRes.data.messages?.length > 0) {
         lastMsgId.current = msgsRes.data.messages[msgsRes.data.messages.length - 1].id;
+        msgsRes.data.messages.forEach((m: any) => processedMsgIds.current.add(m.id));
         const unread = msgsRes.data.messages
           .filter((m: any) => m.sender_id !== user?.id && !m.read_by?.includes(user?.id))
           .map((m: any) => m.id);
@@ -143,6 +145,102 @@ export default function ChatDetailScreen() {
   }, [id, user]);
 
   useEffect(() => { loadChat(); }, [loadChat]);
+
+  useEffect(() => {
+    if (!id) return;
+
+    const socket = getSocket();
+    if (!socket) return;
+
+    const handleNewMessage = (data: { chat_id: string; message: any }) => {
+      if (data.chat_id !== id) return;
+      if (processedMsgIds.current.has(data.message.id)) return;
+      processedMsgIds.current.add(data.message.id);
+
+      const processIncomingMessage = async (msg: any) => {
+        if (msg.e2ee && msg.content && msg.nonce) {
+          if (chat?.is_group) {
+            const result = await groupDecrypt(
+              msg.content, msg.nonce, id,
+              msg.sender_id,
+              msg.sender_key_id || '',
+              msg.sender_key_iteration || 0,
+              msg.media_ciphertext || null,
+              msg.media_nonce || null
+            );
+            return {
+              ...msg,
+              content: result.text || '[Entschlüsselung fehlgeschlagen]',
+              media_base64: result.mediaBase64 || msg.media_base64,
+              _decrypted: true,
+            };
+          } else {
+            const result = await ratchetDecrypt(
+              msg.content, msg.nonce, id,
+              msg.dh_public || null,
+              msg.media_ciphertext || null,
+              msg.media_nonce || null
+            );
+            return {
+              ...msg,
+              content: result.text || '[Entschlüsselung fehlgeschlagen]',
+              media_base64: result.mediaBase64 || msg.media_base64,
+              _decrypted: true,
+            };
+          }
+        }
+        return msg;
+      };
+
+      processIncomingMessage(data.message).then((processedMsg) => {
+        setMessages(prev => [...prev, processedMsg]);
+        lastMsgId.current = processedMsg.id;
+        if (processedMsg.sender_id !== user?.id) {
+          messagesAPI.markRead([processedMsg.id]).catch(() => {});
+        }
+      });
+    };
+
+    const handleTypingStart = (data: { chat_id: string; user: any }) => {
+      if (data.chat_id !== id) return;
+      setTypingUsers(prev => {
+        const exists = prev.some((u: any) => u.id === data.user.id);
+        if (exists) return prev;
+        return [...prev, data.user];
+      });
+    };
+
+    const handleTypingStop = (data: { chat_id: string; user_id: string }) => {
+      if (data.chat_id !== id) return;
+      setTypingUsers(prev => prev.filter((u: any) => u.id !== data.user_id));
+    };
+
+    const handleChatUpdated = (data: { chat_id: string; updates: any }) => {
+      if (data.chat_id !== id) return;
+      setChat((prev: any) => prev ? { ...prev, ...data.updates } : prev);
+    };
+
+    const handleConnect = () => setWsConnected(true);
+    const handleDisconnect = () => setWsConnected(false);
+
+    socket.on('new_message', handleNewMessage);
+    socket.on('typing_start', handleTypingStart);
+    socket.on('typing_stop', handleTypingStop);
+    socket.on('chat_updated', handleChatUpdated);
+    socket.on('connect', handleConnect);
+    socket.on('disconnect', handleDisconnect);
+
+    setWsConnected(socket.connected);
+
+    return () => {
+      socket.off('new_message', handleNewMessage);
+      socket.off('typing_start', handleTypingStart);
+      socket.off('typing_stop', handleTypingStop);
+      socket.off('chat_updated', handleChatUpdated);
+      socket.off('connect', handleConnect);
+      socket.off('disconnect', handleDisconnect);
+    };
+  }, [id, user, chat?.is_group]);
 
   const initE2EESession = async (chatData: any) => {
     try {
@@ -194,68 +292,6 @@ export default function ChatDetailScreen() {
     }
   };
 
-  useEffect(() => {
-    if (!id) return;
-    const interval = setInterval(async () => {
-      try {
-        const res = await messagesAPI.poll(id, lastMsgId.current || undefined);
-        if (res.data.messages?.length > 0) {
-          const newMsgs = [];
-          for (const msg of res.data.messages) {
-            if (msg.e2ee && msg.content && msg.nonce) {
-              if (chat?.is_group) {
-                const result = await groupDecrypt(
-                  msg.content, msg.nonce, id,
-                  msg.sender_id,
-                  msg.sender_key_id || '',
-                  msg.sender_key_iteration || 0,
-                  msg.media_ciphertext || null,
-                  msg.media_nonce || null
-                );
-                newMsgs.push({
-                  ...msg,
-                  content: result.text || '[Entschlüsselung fehlgeschlagen]',
-                  media_base64: result.mediaBase64 || msg.media_base64,
-                  _decrypted: true,
-                });
-              } else {
-                const result = await ratchetDecrypt(
-                  msg.content, msg.nonce, id,
-                  msg.dh_public || null,
-                  msg.media_ciphertext || null,
-                  msg.media_nonce || null
-                );
-                newMsgs.push({
-                  ...msg,
-                  content: result.text || '[Entschlüsselung fehlgeschlagen]',
-                  media_base64: result.mediaBase64 || msg.media_base64,
-                  _decrypted: true,
-                });
-              }
-            } else {
-              newMsgs.push(msg);
-            }
-          }
-          setMessages(prev => {
-            const existingIds = new Set(prev.map(m => m.id));
-            const filteredNew = newMsgs.filter((m: any) => !existingIds.has(m.id));
-            if (filteredNew.length === 0) return prev;
-            return [...prev, ...filteredNew];
-          });
-          const lastNew = res.data.messages[res.data.messages.length - 1];
-          lastMsgId.current = lastNew.id;
-          const unread = res.data.messages
-            .filter((m: any) => m.sender_id !== user?.id)
-            .map((m: any) => m.id);
-          if (unread.length > 0) messagesAPI.markRead(unread);
-        }
-        const typRes = await typingAPI.get(id);
-        setTypingUsers(typRes.data.typing || []);
-      } catch {}
-    }, 2000);
-    return () => clearInterval(interval);
-  }, [id, user, chat?.is_group]);
-
   const handleSend = async () => {
     if (!text.trim() || !id) return;
     setSending(true);
@@ -279,6 +315,7 @@ export default function ChatDetailScreen() {
             msg._e2ee_sent = true;
             setMessages(prev => [...prev, msg]);
             lastMsgId.current = msg.id;
+            processedMsgIds.current.add(msg.id);
           } else {
             throw new Error('Group encryption failed');
           }
@@ -301,6 +338,7 @@ export default function ChatDetailScreen() {
             msg._e2ee_sent = true;
             setMessages(prev => [...prev, msg]);
             lastMsgId.current = msg.id;
+            processedMsgIds.current.add(msg.id);
           } else {
             throw new Error('Encryption failed');
           }
@@ -314,10 +352,12 @@ export default function ChatDetailScreen() {
         });
         setMessages(prev => [...prev, res.data.message]);
         lastMsgId.current = res.data.message.id;
+        processedMsgIds.current.add(res.data.message.id);
       }
       setText('');
       setSelfDestruct(null);
       setReplyTo(null);
+      emitStopTyping(id);
     } catch (e) {
       console.log('Error sending message', e);
     } finally {
@@ -352,6 +392,7 @@ export default function ChatDetailScreen() {
             msg._e2ee_sent = true;
             setMessages(prev => [...prev, msg]);
             lastMsgId.current = msg.id;
+            processedMsgIds.current.add(msg.id);
           }
         } else {
           const encrypted = await ratchetEncrypt(`🎤 Sprachnachricht (${Math.floor(durationMs / 1000)}s)`, id, 'voice', audioBase64);
@@ -374,6 +415,7 @@ export default function ChatDetailScreen() {
             msg._e2ee_sent = true;
             setMessages(prev => [...prev, msg]);
             lastMsgId.current = msg.id;
+            processedMsgIds.current.add(msg.id);
           }
         }
       } else {
@@ -387,6 +429,7 @@ export default function ChatDetailScreen() {
         });
         setMessages(prev => [...prev, res.data.message]);
         lastMsgId.current = res.data.message.id;
+        processedMsgIds.current.add(res.data.message.id);
       }
     } catch (e) {
       console.log('Error sending voice message', e);
@@ -399,250 +442,173 @@ export default function ChatDetailScreen() {
     if (!id) return;
     setSendingLocation(true);
     try {
-      let latitude: number, longitude: number, accuracy: number;
-
-      if (Platform.OS === 'web') {
-        const pos = await new Promise<GeolocationPosition>((resolve, reject) => {
-          navigator.geolocation.getCurrentPosition(resolve, reject, { enableHighAccuracy: true });
-        });
-        latitude = pos.coords.latitude;
-        longitude = pos.coords.longitude;
-        accuracy = pos.coords.accuracy;
-      } else {
-        const { status } = await Location.requestForegroundPermissionsAsync();
-        if (status !== 'granted') {
-          Alert.alert('Fehler', 'Standortberechtigung benötigt');
-          return;
-        }
-        const loc = await Location.getCurrentPositionAsync({});
-        latitude = loc.coords.latitude;
-        longitude = loc.coords.longitude;
-        accuracy = loc.coords.accuracy || 0;
+      const { status } = await Location.requestForegroundPermissionsAsync();
+      if (status !== 'granted') {
+        Alert.alert('Berechtigung fehlt', 'Standortzugriff ist erforderlich.');
+        return;
       }
-
-      const locationData = JSON.stringify({ latitude, longitude, accuracy });
-
+      const loc = await Location.getCurrentPositionAsync({});
+      const coords = `${loc.coords.latitude.toFixed(6)}, ${loc.coords.longitude.toFixed(6)}`;
       if (e2eeSessionRef.current) {
         if (chat?.is_group) {
-          const encrypted = await groupEncrypt(`📍 Standort`, id, 'location', locationData);
+          const encrypted = await groupEncrypt(`📍 Standort: ${coords}`, id);
           if (encrypted) {
-            await encryptedMessagesAPI.send({
-              chat_id: id,
-              ciphertext: encrypted.ciphertext,
-              nonce: encrypted.nonce,
-              sender_key_id: encrypted.senderKeyId,
-              sender_key_iteration: encrypted.iteration,
-              message_type: 'location',
-              media_ciphertext: encrypted.mediaCiphertext,
-              media_nonce: encrypted.mediaNonce,
-              security_level: securityLevel,
+            const res = await encryptedMessagesAPI.send({
+              chat_id: id, ciphertext: encrypted.ciphertext, nonce: encrypted.nonce,
+              sender_key_id: encrypted.senderKeyId, sender_key_iteration: encrypted.iteration,
+              message_type: 'location', security_level: securityLevel,
             });
+            const msg = res.data.message;
+            msg.content = `📍 Standort: ${coords}`;
+            msg._e2ee_sent = true;
+            setMessages(prev => [...prev, msg]);
+            lastMsgId.current = msg.id;
+            processedMsgIds.current.add(msg.id);
           }
         } else {
-          const encrypted = await ratchetEncrypt(`📍 Standort`, id, 'location', locationData);
+          const encrypted = await ratchetEncrypt(`📍 Standort: ${coords}`, id);
           if (encrypted) {
-            await encryptedMessagesAPI.send({
-              chat_id: id,
-              ciphertext: encrypted.ciphertext,
-              nonce: encrypted.nonce,
-              dh_public: encrypted.dhPublic,
-              msg_num: encrypted.msgNum,
-              media_ciphertext: encrypted.mediaCiphertext,
-              media_nonce: encrypted.mediaNonce,
-              message_type: 'location',
-              security_level: securityLevel,
+            const res = await encryptedMessagesAPI.send({
+              chat_id: id, ciphertext: encrypted.ciphertext, nonce: encrypted.nonce,
+              dh_public: encrypted.dhPublic, msg_num: encrypted.msgNum,
+              message_type: 'location', security_level: securityLevel,
             });
+            const msg = res.data.message;
+            msg.content = `📍 Standort: ${coords}`;
+            msg._e2ee_sent = true;
+            setMessages(prev => [...prev, msg]);
+            lastMsgId.current = msg.id;
+            processedMsgIds.current.add(msg.id);
           }
         }
       } else {
-        await messagesAPI.send({
-          chat_id: id,
-          content: `📍 Standort`,
-          message_type: 'location',
-          media_base64: locationData,
-          security_level: securityLevel,
+        const res = await messagesAPI.send({
+          chat_id: id, content: `📍 Standort: ${coords}`,
+          message_type: 'location', security_level: securityLevel,
         });
+        setMessages(prev => [...prev, res.data.message]);
+        lastMsgId.current = res.data.message.id;
+        processedMsgIds.current.add(res.data.message.id);
       }
     } catch (e) {
       console.log('Error sending location', e);
-      Alert.alert('Fehler', 'Standort konnte nicht gesendet werden');
     } finally {
       setSendingLocation(false);
     }
   };
 
   const pickImage = async () => {
-    setShowMediaMenu(false);
-    if (Platform.OS === 'web') {
-      const input = document.createElement('input');
-      input.type = 'file';
-      input.accept = 'image/*';
-      input.onchange = async (e: any) => {
-        const file = e.target.files[0];
-        if (!file) return;
-        const reader = new FileReader();
-        reader.readAsDataURL(file);
-        reader.onloadend = () => {
-          const base64 = (reader.result as string).split(',')[1];
-          setPendingMedia({ uri: URL.createObjectURL(file), base64, type: 'image' });
-        };
-      };
-      input.click();
-    } else {
-      const result = await ImagePicker.launchImageLibraryAsync({
-        mediaTypes: ImagePicker.MediaTypeOptions.Images,
-        allowsEditing: false,
-        quality: 0.8,
-        base64: true,
+    const result = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: ImagePicker.MediaTypeOptions.Images,
+      base64: true,
+      quality: 0.7,
+    });
+    if (!result.canceled && result.assets[0]) {
+      setPendingMedia({
+        uri: result.assets[0].uri,
+        base64: result.assets[0].base64 || '',
+        type: 'image',
+        fileName: result.assets[0].fileName || undefined,
       });
-      if (!result.canceled && result.assets[0]) {
-        setPendingMedia({
-          uri: result.assets[0].uri,
-          base64: result.assets[0].base64 || '',
-          type: 'image',
-        });
-      }
     }
+    setShowMediaMenu(false);
   };
 
   const pickVideo = async () => {
-    setShowMediaMenu(false);
-    if (Platform.OS === 'web') {
-      const input = document.createElement('input');
-      input.type = 'file';
-      input.accept = 'video/*';
-      input.onchange = async (e: any) => {
-        const file = e.target.files[0];
-        if (!file) return;
-        const reader = new FileReader();
-        reader.readAsDataURL(file);
-        reader.onloadend = () => {
-          const base64 = (reader.result as string).split(',')[1];
-          setPendingMedia({ uri: URL.createObjectURL(file), base64, type: 'video' });
-        };
-      };
-      input.click();
-    } else {
-      const result = await ImagePicker.launchImageLibraryAsync({
-        mediaTypes: ImagePicker.MediaTypeOptions.Videos,
-        allowsEditing: false,
-        quality: 0.7,
-        base64: true,
+    const result = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: ImagePicker.MediaTypeOptions.Videos,
+      base64: true,
+      quality: 0.5,
+    });
+    if (!result.canceled && result.assets[0]) {
+      setPendingMedia({
+        uri: result.assets[0].uri,
+        base64: result.assets[0].base64 || '',
+        type: 'video',
+        fileName: result.assets[0].fileName || undefined,
       });
-      if (!result.canceled && result.assets[0]) {
-        setPendingMedia({
-          uri: result.assets[0].uri,
-          base64: result.assets[0].base64 || '',
-          type: 'video',
-        });
-      }
     }
+    setShowMediaMenu(false);
   };
 
   const pickFile = async () => {
-    setShowMediaMenu(false);
-    if (Platform.OS === 'web') {
-      const input = document.createElement('input');
-      input.type = 'file';
-      input.onchange = async (e: any) => {
-        const file = e.target.files[0];
-        if (!file) return;
-        const reader = new FileReader();
-        reader.readAsDataURL(file);
-        reader.onloadend = () => {
-          const base64 = (reader.result as string).split(',')[1];
-          setPendingMedia({ uri: URL.createObjectURL(file), base64, type: 'file', fileName: file.name });
-        };
-      };
-      input.click();
-    } else {
-      const result = await DocumentPicker.getDocumentAsync({
-        copyToCacheDirectory: true,
+    const result = await DocumentPicker.getDocumentAsync({});
+    if (!result.canceled && result.assets[0]) {
+      const file = result.assets[0];
+      const base64 = await readFileAsBase64(file.uri);
+      setPendingMedia({
+        uri: file.uri,
+        base64,
+        type: 'file',
+        fileName: file.name,
       });
-      if (!result.canceled && result.assets[0]) {
-        const file = result.assets[0];
-        const response = await fetch(file.uri);
-        const blob = await response.blob();
-        const reader = new FileReader();
-        reader.readAsDataURL(blob);
-        reader.onloadend = () => {
-          const base64 = (reader.result as string).split(',')[1];
-          setPendingMedia({
-            uri: file.uri,
-            base64,
-            type: 'file',
-            fileName: file.name,
-          });
-        };
-      }
     }
+    setShowMediaMenu(false);
+  };
+
+  const readFileAsBase64 = async (uri: string): Promise<string> => {
+    const response = await fetch(uri);
+    const blob = await response.blob();
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        const base64 = (reader.result as string).split(',')[1];
+        resolve(base64);
+      };
+      reader.onerror = reject;
+      reader.readAsDataURL(blob);
+    });
   };
 
   const sendPendingMedia = async () => {
     if (!pendingMedia || !id) return;
     setSending(true);
     try {
-      const mediaLabel = pendingMedia.type === 'image' ? '📷 Foto' :
-                         pendingMedia.type === 'video' ? '🎥 Video' :
-                         `📎 ${pendingMedia.fileName || 'Datei'}`;
-
       if (e2eeSessionRef.current) {
         if (chat?.is_group) {
-          const encrypted = await groupEncrypt(mediaLabel, id, pendingMedia.type, pendingMedia.base64);
+          const encrypted = await groupEncrypt(pendingMedia.fileName || 'Datei', id, pendingMedia.type, pendingMedia.base64);
           if (encrypted) {
             const res = await encryptedMessagesAPI.send({
-              chat_id: id,
-              ciphertext: encrypted.ciphertext,
-              nonce: encrypted.nonce,
-              sender_key_id: encrypted.senderKeyId,
-              sender_key_iteration: encrypted.iteration,
-              message_type: pendingMedia.type,
-              media_ciphertext: encrypted.mediaCiphertext,
-              media_nonce: encrypted.mediaNonce,
-              security_level: securityLevel,
-              self_destruct_seconds: selfDestruct,
+              chat_id: id, ciphertext: encrypted.ciphertext, nonce: encrypted.nonce,
+              sender_key_id: encrypted.senderKeyId, sender_key_iteration: encrypted.iteration,
+              message_type: pendingMedia.type, media_ciphertext: encrypted.mediaCiphertext,
+              media_nonce: encrypted.mediaNonce, security_level: securityLevel,
             });
             const msg = res.data.message;
-            msg.content = mediaLabel;
+            msg.content = pendingMedia.fileName || 'Datei';
             msg.media_base64 = pendingMedia.base64;
             msg._e2ee_sent = true;
             setMessages(prev => [...prev, msg]);
             lastMsgId.current = msg.id;
+            processedMsgIds.current.add(msg.id);
           }
         } else {
-          const encrypted = await ratchetEncrypt(mediaLabel, id, pendingMedia.type, pendingMedia.base64);
+          const encrypted = await ratchetEncrypt(pendingMedia.fileName || 'Datei', id, pendingMedia.type, pendingMedia.base64);
           if (encrypted) {
             const res = await encryptedMessagesAPI.send({
-              chat_id: id,
-              ciphertext: encrypted.ciphertext,
-              nonce: encrypted.nonce,
-              dh_public: encrypted.dhPublic,
-              msg_num: encrypted.msgNum,
-              message_type: pendingMedia.type,
-              media_ciphertext: encrypted.mediaCiphertext,
-              media_nonce: encrypted.mediaNonce,
-              security_level: securityLevel,
-              self_destruct_seconds: selfDestruct,
+              chat_id: id, ciphertext: encrypted.ciphertext, nonce: encrypted.nonce,
+              dh_public: encrypted.dhPublic, msg_num: encrypted.msgNum,
+              message_type: pendingMedia.type, media_ciphertext: encrypted.mediaCiphertext,
+              media_nonce: encrypted.mediaNonce, security_level: securityLevel,
             });
             const msg = res.data.message;
-            msg.content = mediaLabel;
+            msg.content = pendingMedia.fileName || 'Datei';
             msg.media_base64 = pendingMedia.base64;
             msg._e2ee_sent = true;
             setMessages(prev => [...prev, msg]);
             lastMsgId.current = msg.id;
+            processedMsgIds.current.add(msg.id);
           }
         }
       } else {
         const res = await messagesAPI.send({
-          chat_id: id,
-          content: mediaLabel,
-          message_type: pendingMedia.type,
-          media_base64: pendingMedia.base64,
+          chat_id: id, content: pendingMedia.fileName || 'Datei',
+          message_type: pendingMedia.type, media_base64: pendingMedia.base64,
           security_level: securityLevel,
-          self_destruct_seconds: selfDestruct,
         });
         setMessages(prev => [...prev, res.data.message]);
         lastMsgId.current = res.data.message.id;
+        processedMsgIds.current.add(res.data.message.id);
       }
       setPendingMedia(null);
     } catch (e) {
@@ -652,15 +618,75 @@ export default function ChatDetailScreen() {
     }
   };
 
-  const cancelPendingMedia = () => {
-    setPendingMedia(null);
+  const loadContacts = async () => {
+    try {
+      const res = await contactsAPI.list();
+      setContacts(res.data.contacts || []);
+    } catch (e) {
+      console.log('Error loading contacts', e);
+    }
+  };
+
+  const addMember = async (contactId: string) => {
+    try {
+      await chatsAPI.addMember(id!, contactId);
+      const chatRes = await chatsAPI.get(id!);
+      setGroupMembers(chatRes.data.chat.participants || []);
+      setContacts(prev => prev.filter(c => c.id !== contactId));
+    } catch (e: any) {
+      Alert.alert('Fehler', e?.response?.data?.detail || 'Teilnehmer hinzufügen fehlgeschlagen');
+    }
+  };
+
+  const removeMember = async (memberId: string) => {
+    try {
+      await chatsAPI.removeMember(id!, memberId);
+      const chatRes = await chatsAPI.get(id!);
+      setGroupMembers(chatRes.data.chat.participants || []);
+    } catch (e: any) {
+      Alert.alert('Fehler', e?.response?.data?.detail || 'Teilnehmer entfernen fehlgeschlagen');
+    }
+  };
+
+  const saveGroupName = async () => {
+    try {
+      await chatsAPI.update(id!, { name: groupName });
+      setChat((prev: any) => prev ? { ...prev, name: groupName } : prev);
+      setEditingGroupName(false);
+    } catch (e: any) {
+      Alert.alert('Fehler', e?.response?.data?.detail || 'Gruppenname ändern fehlgeschlagen');
+    }
+  };
+
+  const loadChatsForForward = async () => {
+    try {
+      const res = await chatsAPI.list();
+      setForwardTargetChats((res.data.chats || []).filter((c: any) => c.id !== id));
+    } catch (e) {
+      console.log('Error loading chats for forward', e);
+    }
+  };
+
+  const handleForward = async (targetChatId: string) => {
+    if (!messageActions?.msg) return;
+    setForwardingMsg(messageActions.msg.id);
+    try {
+      await messagesAPI.forward(messageActions.msg.id, targetChatId);
+      setShowForwardModal(false);
+    } catch (e) {
+      console.log('Forward failed', e);
+    } finally {
+      setForwardingMsg(null);
+    }
   };
 
   const handleTyping = () => {
     if (!id) return;
     if (typingTimer.current) clearTimeout(typingTimer.current);
-    typingAPI.set(id).catch(() => {});
-    typingTimer.current = setTimeout(() => {}, 3000);
+    emitTyping(id);
+    typingTimer.current = setTimeout(() => {
+      emitStopTyping(id);
+    }, 3000);
   };
 
   const getOtherParticipant = () => {
@@ -679,410 +705,254 @@ export default function ChatDetailScreen() {
     return other?.status === 'online' ? 'Online' : 'Offline';
   };
 
-  const startCall = async (callType: 'audio' | 'video') => {
-    if (!id || !user) return;
-
-    const otherParticipant = getOtherParticipant();
-    if (!otherParticipant) {
-      Alert.alert('Fehler', 'Konnte den Gesprächspartner nicht finden');
-      return;
-    }
-
-    const callId = `${id}_${Date.now()}`;
-
-    // Navigate to the call screen
-    router.push(`/call/${callId}`, {
-      remoteUserId: otherParticipant.id,
-      remoteName: otherParticipant.name,
-      callType,
-      isIncoming: 'false',
-    });
-  };
-
   const getSecColor = (level: string) => {
-    const found = SECURITY_LEVELS.find(s => s.key === level);
-    return found?.color || COLORS.unclassified;
-  };
-
-  const getStatusIcon = (msg: any) => {
-    if (msg.sender_id !== user?.id) return null;
-    const participantCount = (chat?.participants?.length || 2) - 1;
-    const readCount = (msg.read_by?.length || 0) - 1;
-    const deliveredCount = (msg.delivered_to?.length || 0);
-    if (readCount >= participantCount) return { name: 'checkmark-done', color: COLORS.primaryLight };
-    if (deliveredCount >= participantCount) return { name: 'checkmark-done', color: COLORS.textMuted };
-    return { name: 'checkmark', color: COLORS.textMuted };
+    const map: any = { UNCLASSIFIED: COLORS.unclassified, RESTRICTED: COLORS.restricted, CONFIDENTIAL: COLORS.confidential, SECRET: COLORS.secret };
+    return map[level] || COLORS.unclassified;
   };
 
   const formatTime = (dateStr: string) => {
     if (!dateStr) return '';
     const d = new Date(dateStr);
-    return d.toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' });
-  };
-
-  const getSenderName = (msg: any) => {
-    if (!chat?.is_group || msg.sender_id === user?.id) return '';
-    const sender = chat.participants?.find((p: any) => p.id === msg.sender_id);
-    return sender?.name || msg.sender_name || 'Unbekannt';
-  };
-
-  const getSenderColor = (senderId: string) => {
-    const colors = [COLORS.primary, '#4A90D9', '#7B68EE', '#20B2AA', '#FF6B6B', '#FFD93D', '#6BCB77'];
-    let hash = 0;
-    for (let i = 0; i < senderId.length; i++) hash = senderId.charCodeAt(i) + ((hash << 5) - hash);
-    return colors[Math.abs(hash) % colors.length];
+    const now = new Date();
+    const diffMs = now.getTime() - d.getTime();
+    const diffHrs = diffMs / (1000 * 60 * 60);
+    if (diffHrs < 24) return d.toLocaleTimeString('de-DE', { hour: '2-digit', minute: 'digit' });
+    if (diffHrs < 48) return 'Gestern';
+    return d.toLocaleDateString('de-DE', { day: '2-digit', month: '2-digit' });
   };
 
   const getInitial = (name: string) => name?.charAt(0).toUpperCase() || '?';
 
-  const getAvatarColor = (id: string) => {
+  const getAvatarColor = (chatId: string) => {
     const colors = [COLORS.primary, '#4A90D9', '#7B68EE', '#20B2AA', '#FF6B6B', '#FFD93D', '#6BCB77'];
     let hash = 0;
-    for (let i = 0; i < id.length; i++) hash = id.charCodeAt(i) + ((hash << 5) - hash);
+    for (let i = 0; i < chatId.length; i++) hash = chatId.charCodeAt(i) + ((hash << 5) - hash);
     return colors[Math.abs(hash) % colors.length];
   };
 
-  const filteredMessages = searchQuery.trim()
-    ? messages.filter(m => m.content?.toLowerCase().includes(searchQuery.toLowerCase()))
-    : messages;
-
-  const loadContacts = async () => {
-    try {
-      const res = await contactsAPI.list();
-      setContacts(res.data.contacts || []);
-    } catch (e) { console.log(e); }
-  };
-
-  const loadChatsForForward = async () => {
-    try {
-      const res = await chatsAPI.list();
-      setForwardTargetChats((res.data.chats || []).filter((c: any) => c.id !== id));
-    } catch (e) { console.log(e); }
-  };
-
-  const handleForward = async (targetChatId: string) => {
-    if (!messageActions?.msg?.id) return;
-    setForwardingMsg(messageActions.msg.id);
-    try {
-      await messagesAPI.forward(messageActions.msg.id, targetChatId);
-      setShowForwardModal(false);
-      setMessageActions(null);
-    } catch (e: any) {
-      Alert.alert('Fehler', e?.response?.data?.detail || 'Weiterleiten fehlgeschlagen');
-    } finally {
-      setForwardingMsg(null);
-    }
-  };
-
-  const loadStarredMessages = async () => {
-    try {
-      const res = await messagesAPI.getStarred(id!);
-      setStarredMessages(res.data.messages || []);
-    } catch (e) { console.log(e); }
-  };
-
-  const addMember = async (contactId: string) => {
-    Alert.alert(
-      'Teilnehmer hinzufügen',
-      'Möchtest du diesen Kontakt zur Gruppe hinzufügen?',
-      [
-        { text: 'Abbrechen', style: 'cancel' },
-        {
-          text: 'Hinzufügen',
-          onPress: async () => {
-            try {
-              await chatsAPI.addMember(id!, contactId);
-              const updated = await chatsAPI.get(id!);
-              setGroupMembers(updated.data.chat.participants || []);
-              Alert.alert('Erfolg', 'Mitglied hinzugefügt');
-            } catch (e: any) {
-              Alert.alert('Fehler', e?.response?.data?.detail || 'Konnte nicht hinzufügen');
-            }
-          },
-        },
-      ]
-    );
-  };
-
-  const removeMember = async (memberId: string) => {
-    Alert.alert(
-      'Teilnehmer entfernen',
-      'Möchtest du dieses Mitglied wirklich entfernen?',
-      [
-        { text: 'Abbrechen', style: 'cancel' },
-        {
-          text: 'Entfernen',
-          style: 'destructive',
-          onPress: async () => {
-            try {
-              await chatsAPI.removeMember(id!, memberId);
-              const updated = await chatsAPI.get(id!);
-              setGroupMembers(updated.data.chat.participants || []);
-            } catch (e: any) {
-              Alert.alert('Fehler', e?.response?.data?.detail || 'Konnte nicht entfernen');
-            }
-          },
-        },
-      ]
-    );
-  };
-
-  const saveGroupName = async () => {
-    try {
-      await chatsAPI.update(id!, { name: groupName });
-      const updated = await chatsAPI.get(id!);
-      setChat(updated.data.chat);
-      setEditingGroupName(false);
-    } catch (e: any) {
-      Alert.alert('Fehler', e?.response?.data?.detail || 'Konnte nicht speichern');
-    }
-  };
-
   const renderMessage = ({ item, index }: { item: any; index: number }) => {
-    const isMine = item.sender_id === user?.id;
-    const statusIcon = getStatusIcon(item);
-    const isEmergency = item.is_emergency;
-    const showSenderName = chat?.is_group && !isMine;
-    const senderName = getSenderName(item);
-    const senderColor = getSenderColor(item.sender_id);
-    const hasMedia = item.media_base64 || (item.e2ee && item.media_ciphertext);
-
-    const showDate = index === 0 || (
-      new Date(item.created_at).toDateString() !== new Date(filteredMessages[index - 1]?.created_at).toDateString()
-    );
-
-    const showNameSeparator = chat?.is_group && !isMine && index > 0 &&
-      filteredMessages[index - 1]?.sender_id !== item.sender_id &&
-      new Date(item.created_at).toDateString() === new Date(filteredMessages[index - 1]?.created_at).toDateString();
-
-    const getMediaIcon = (msg: any) => {
-      if (msg.message_type === 'image') return 'image';
-      if (msg.message_type === 'voice') return 'mic';
-      if (msg.message_type === 'file') return 'document';
-      return 'attach';
-    };
-
-    const getMediaLabel = (msg: any) => {
-      if (msg.message_type === 'image') return 'Verschlüsseltes Bild';
-      if (msg.message_type === 'voice') return 'Sprachnachricht';
-      if (msg.message_type === 'file') return 'Verschlüsselte Datei';
-      return 'Verschlüsseltes Medium';
-    };
-
-    const isVoiceMessage = item.message_type === 'voice';
+    const isSent = item.sender_id === user?.id;
+    const prevMsg = index > 0 ? messages[index - 1] : null;
+    const showAvatar = !isSent && (!prevMsg || prevMsg.sender_id !== item.sender_id);
+    const showDate = !prevMsg || new Date(item.created_at).toDateString() !== new Date(prevMsg.created_at).toDateString();
+    const showName = !isSent && chat?.is_group && (!prevMsg || prevMsg.sender_id !== item.sender_id);
+    const reactions = item.reactions || {};
+    const reactionEntries = Object.entries(reactions).filter(([_, users]) => (users as string[]).length > 0);
 
     return (
-      <View>
+      <>
         {showDate && (
           <View style={styles.dateSeparator}>
             <View style={styles.dateLine} />
-            <Text style={styles.dateText}>
-              {new Date(item.created_at).toLocaleDateString('de-DE', { day: '2-digit', month: 'long', year: 'numeric' })}
-            </Text>
+            <Text style={styles.dateText}>{formatDateSeparator(item.created_at)}</Text>
             <View style={styles.dateLine} />
           </View>
         )}
-        {showNameSeparator && (
+        {showName && (
           <View style={styles.nameSeparator}>
-            <Text style={[styles.nameSeparatorText, { color: senderColor }]}>{senderName}</Text>
+            <Text style={styles.nameSeparatorText}>{item.sender_name || 'Unbekannt'}</Text>
           </View>
         )}
-        <TouchableOpacity
-          style={[styles.msgRow, isMine ? styles.msgRowRight : styles.msgRowLeft]}
-          activeOpacity={0.7}
-          onLongPress={() => setMessageActions({ msg: item, x: 0, y: 0 })}
-          delayLongPress={300}
-        >
-          {!isMine && chat?.is_group && (
-            <View style={[styles.msgAvatar, { backgroundColor: `${senderColor}33` }]}>
-              <Text style={[styles.msgAvatarText, { color: senderColor }]}>{getInitial(senderName)}</Text>
+        <View style={[styles.msgRow, isSent ? styles.msgRowRight : styles.msgRowLeft]}>
+          {!isSent && showAvatar && (
+            <View style={[styles.msgAvatar, { backgroundColor: `${getAvatarColor(item.sender_id || '')}33` }]}>
+              <Text style={[styles.msgAvatarText, { color: getAvatarColor(item.sender_id || '') }]}>{getInitial(item.sender_name || '?')}</Text>
             </View>
           )}
-          <View style={[
-            styles.msgBubble,
-            isMine ? styles.sentBubble : styles.receivedBubble,
-            isEmergency && styles.emergencyBubble,
-          ]}>
-            {isEmergency && (
-              <View style={styles.emergencyBanner}>
-                <Ionicons name="alert-circle" size={12} color={COLORS.danger} />
-                <Text style={styles.emergencyText}>NOTFALL</Text>
-              </View>
-            )}
-            {showSenderName && !showNameSeparator && (
-              <Text style={[styles.senderName, { color: senderColor }]}>{senderName}</Text>
-            )}
-            {item.security_level !== 'UNCLASSIFIED' && (
-              <View style={[styles.msgSecBadge, { borderColor: getSecColor(item.security_level) }]}>
-                <Text style={[styles.msgSecText, { color: getSecColor(item.security_level) }]}>{item.security_level}</Text>
-              </View>
-            )}
-            {item.reply_to && (
-              <View style={styles.replyPreview}>
-                <View style={styles.replyPreviewIndicator} />
-                <Text style={styles.replyPreviewText} numberOfLines={1}>Antwort auf {item.reply_to_sender_name || 'Nachricht'}</Text>
-              </View>
-            )}
-            {isVoiceMessage && item.media_base64 ? (
-              <VoiceMessagePlayer
-                audioBase64={item.media_base64}
-                durationMs={parseInt(item.content?.match(/\((\d+)s\)/)?.[1] || '0') * 1000 || 0}
-                isMine={isMine}
-              />
-            ) : hasMedia ? (
-              <View style={styles.mediaContainer}>
-                {item.message_type === 'image' && item.media_base64 ? (
-                  <Image
-                    source={{ uri: `data:image/jpeg;base64,${item.media_base64}` }}
-                    style={styles.msgImage}
-                    resizeMode="contain"
-                  />
-                ) : (
-                  <>
-                    <Ionicons name={getMediaIcon(item)} size={24} color={COLORS.primaryLight} />
-                    <Text style={styles.mediaLabel}>{getMediaLabel(item)}</Text>
-                  </>
-                )}
-              </View>
-            ) : null}
-            {!isVoiceMessage && <Text style={styles.msgContent}>{item.content}</Text>}
-            <View style={styles.msgFooter}>
-              {item.e2ee && <Ionicons name="lock-closed" size={9} color="#4CAF50" />}
-              {item.encrypted && !item.e2ee && <Ionicons name="lock-closed" size={9} color={COLORS.textMuted} />}
-              {item.self_destruct_seconds && (
-                <View style={styles.destructBadge}>
-                  <Ionicons name="timer" size={9} color={COLORS.restricted} />
-                  <Text style={styles.destructText}>{item.self_destruct_seconds}s</Text>
+          {!isSent && !showAvatar && <View style={{ width: 34, marginRight: 6, marginBottom: 4 }} />}
+          <TouchableOpacity
+            activeOpacity={0.8}
+            onLongPress={(event) => {
+              const { pageX, pageY } = event.nativeEvent;
+              setMessageActions({ msg: item, x: pageX, y: pageY });
+            }}
+          >
+            <View style={[
+              styles.msgBubble,
+              isSent ? styles.sentBubble : styles.receivedBubble,
+              item.emergency && styles.emergencyBubble,
+            ]}>
+              {item.emergency && (
+                <View style={styles.emergencyBanner}>
+                  <Ionicons name="warning" size={12} color={COLORS.danger} />
+                  <Text style={styles.emergencyText}>EMERGENCY</Text>
                 </View>
               )}
-              <Text style={styles.msgTime}>{formatTime(item.created_at)}</Text>
-              {item.edited && <Text style={styles.msgEdited}>(bearbeitet)</Text>}
-              {statusIcon && <Ionicons name={statusIcon.name as any} size={14} color={statusIcon.color} />}
-            </View>
-          </View>
-          {item.reactions && Object.keys(item.reactions).length > 0 && (
-            <View style={[styles.msgReactions, isMine ? styles.msgReactionsRight : styles.msgReactionsLeft]}>
-              {Object.entries(item.reactions).map(([emoji, users]: [string, any]) => (
-                <View key={emoji} style={styles.msgReaction}>
-                  <Text style={styles.msgReactionEmoji}>{emoji}</Text>
-                  <Text style={styles.msgReactionCount}>{users.length}</Text>
+              {item.reply_to && (
+                <View style={styles.replyPreview}>
+                  <View style={styles.replyPreviewIndicator} />
+                  <Text style={styles.replyPreviewText} numberOfLines={1}>
+                    {item.reply_to_content || 'Nachricht'}
+                  </Text>
                 </View>
-              ))}
+              )}
+              {item.message_type === 'voice' ? (
+                <VoiceMessagePlayer audioBase64={item.media_base64} />
+              ) : item.message_type === 'image' && item.media_base64 ? (
+                <Image source={{ uri: `data:image/jpeg;base64,${item.media_base64}` }} style={styles.msgImage} />
+              ) : item.message_type === 'location' ? (
+                <TouchableOpacity style={styles.mediaContainer} onPress={() => {}}>
+                  <Ionicons name="location" size={32} color={COLORS.primaryLight} />
+                  <Text style={styles.mediaLabel}>{item.content}</Text>
+                </TouchableOpacity>
+              ) : (
+                <Text style={styles.msgContent}>{item.content}</Text>
+              )}
+              <View style={styles.msgFooter}>
+                <Text style={styles.msgTime}>{formatTime(item.created_at)}</Text>
+                {item.self_destruct_seconds && (
+                  <View style={styles.destructBadge}>
+                    <Ionicons name="timer" size={10} color={COLORS.restricted} />
+                    <Text style={styles.destructText}>{item.self_destruct_seconds}s</Text>
+                  </View>
+                )}
+                {isSent && (
+                  <Ionicons
+                    name={item.read_by?.includes(user?.id) ? 'checkmark-done' : 'checkmark'}
+                    size={12}
+                    color={item.read_by?.includes(user?.id) ? COLORS.primaryLight : COLORS.textMuted}
+                  />
+                )}
+                {item.edited && <Text style={styles.msgEdited}>(bearbeitet)</Text>}
+              </View>
             </View>
-          )}
-        </TouchableOpacity>
-      </View>
+            {reactionEntries.length > 0 && (
+              <View style={[styles.msgReactions, isSent ? styles.msgReactionsRight : styles.msgReactionsLeft]}>
+                {reactionEntries.slice(0, 3).map(([emoji, users]) => (
+                  <View key={emoji} style={styles.msgReaction}>
+                    <Text style={styles.msgReactionEmoji}>{emoji}</Text>
+                    <Text style={styles.msgReactionCount}>{(users as string[]).length}</Text>
+                  </View>
+                ))}
+              </View>
+            )}
+          </TouchableOpacity>
+        </View>
+      </>
     );
   };
 
+  const formatDateSeparator = (dateStr: string) => {
+    const d = new Date(dateStr);
+    const now = new Date();
+    if (d.toDateString() === now.toDateString()) return 'Heute';
+    const yesterday = new Date(now);
+    yesterday.setDate(now.getDate() - 1);
+    if (d.toDateString() === yesterday.toDateString()) return 'Gestern';
+    return d.toLocaleDateString('de-DE', { day: '2-digit', month: 'long', year: 'numeric' });
+  };
+
   if (loading) {
-    return <View style={styles.loadingContainer}><ActivityIndicator size="large" color={COLORS.primaryLight} /></View>;
+    return (
+      <View style={styles.loadingContainer}>
+        <ActivityIndicator size="large" color={COLORS.primaryLight} />
+      </View>
+    );
   }
 
   return (
-    <SafeAreaView style={styles.safe} edges={['top']}>
-      {/* Header */}
-      <View style={styles.header}>
-        <TouchableOpacity testID="chat-back-btn" onPress={() => router.back()} style={styles.backBtn}>
-          <Ionicons name="chevron-back" size={24} color={COLORS.textPrimary} />
-        </TouchableOpacity>
-        <TouchableOpacity style={styles.headerInfo} onPress={() => { if (chat?.is_group) { setShowGroupInfo(true); loadContacts(); } else if (isE2EESessionActive) { setShowFingerprint(!showFingerprint); } }}>
-          <View style={styles.headerTitleRow}>
-            <View style={[styles.headerAvatar, { backgroundColor: chat?.is_group ? `${getAvatarColor(id || '')}33` : COLORS.surfaceLight }]}>
-              <Ionicons name={chat?.is_group ? 'people' : 'person'} size={16} color={chat?.is_group ? getAvatarColor(id || '') : COLORS.textSecondary} />
-            </View>
-            <View style={styles.headerTextContainer}>
-              <Text style={styles.headerTitle} numberOfLines={1}>{getChatTitle()}</Text>
-              <Text style={styles.headerSubtitle}>{getChatSubtitle()}</Text>
-            </View>
-          </View>
-        </TouchableOpacity>
-        {isE2EESessionActive && (
-          <TouchableOpacity style={[styles.secIndicator, { backgroundColor: '#1B5E20', borderColor: '#4CAF50' }]} onPress={() => setShowVerifyModal(true)}>
-            <Ionicons name={contactVerified ? 'shield-checkmark' : 'lock-closed'} size={12} color="#4CAF50" />
+    <SafeAreaView style={styles.safe} edges={['top', 'bottom']}>
+      <View style={styles.flex}>
+        {/* Header */}
+        <View style={styles.header}>
+          <TouchableOpacity testID="back-btn" style={styles.backBtn} onPress={() => router.back()}>
+            <Ionicons name="arrow-back" size={24} color={COLORS.textPrimary} />
           </TouchableOpacity>
-        )}
-        {!isE2EESessionActive && (
-          <View style={[styles.secIndicator, { backgroundColor: `${COLORS.warning}22`, borderColor: COLORS.warning }]}>
-            <Ionicons name="lock-open" size={12} color={COLORS.warning} />
+          <View style={styles.headerInfo}>
+            <View style={styles.headerTitleRow}>
+              <View style={[styles.headerAvatar, { backgroundColor: `${getAvatarColor(id || '')}33` }]}>
+                <Ionicons name={chat?.is_group ? 'people' : 'person'} size={18} color={chat?.is_group ? getAvatarColor(id || '') : COLORS.textSecondary} />
+              </View>
+              <View style={styles.headerTextContainer}>
+                <Text style={styles.headerTitle} numberOfLines={1}>{getChatTitle()}</Text>
+                <Text style={styles.headerSubtitle} numberOfLines={1}>{getChatSubtitle()}</Text>
+              </View>
+            </View>
           </View>
-        )}
-        <TouchableOpacity style={styles.starBtn} onPress={async () => { await loadStarredMessages(); setShowStarredModal(true); }}>
-          <Ionicons name="star" size={20} color={COLORS.primaryLight} />
-        </TouchableOpacity>
-        <TouchableOpacity style={styles.starBtn} onPress={() => setShowSearch(!showSearch)}>
-          <Ionicons name={showSearch ? 'close' : 'search'} size={20} color={COLORS.primaryLight} />
-        </TouchableOpacity>
-      </View>
-
-      {/* Search Bar */}
-      {showSearch && (
-        <View style={styles.searchBar}>
-          <Ionicons name="search" size={18} color={COLORS.textMuted} />
-          <TextInput
-            style={styles.searchInput}
-            value={searchQuery}
-            onChangeText={setSearchQuery}
-            placeholder="Nachrichten suchen..."
-            placeholderTextColor={COLORS.textMuted}
-            autoFocus
-          />
-          {searchQuery.length > 0 && (
-            <TouchableOpacity onPress={() => setSearchQuery('')}>
-              <Ionicons name="close-circle" size={18} color={COLORS.textMuted} />
+          <TouchableOpacity
+            testID="security-menu-btn"
+            style={[styles.secIndicator, { borderColor: getSecColor(securityLevel) }]}
+            onPress={() => setShowSecMenu(!showSecMenu)}
+          >
+            <Ionicons name="shield-checkmark" size={12} color={getSecColor(securityLevel)} />
+            <Text style={[styles.secIndicatorText, { color: getSecColor(securityLevel) }]}>{securityLevel}</Text>
+          </TouchableOpacity>
+          {chat?.is_group ? (
+            <TouchableOpacity testID="group-info-btn" onPress={() => setShowGroupInfo(true)}>
+              <Ionicons name="information-circle" size={24} color={COLORS.textPrimary} />
+            </TouchableOpacity>
+          ) : (
+            <TouchableOpacity testID="e2ee-info-btn" onPress={() => setShowFingerprint(true)}>
+              <Ionicons name="lock-closed" size={20} color={isE2EESessionActive ? COLORS.success : COLORS.textMuted} />
             </TouchableOpacity>
           )}
         </View>
-      )}
 
-      <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : 'height'} style={styles.flex} keyboardVerticalOffset={0}>
-        {/* Pinned Message Bar */}
+        {/* Pinned message bar */}
         {pinnedMessage && (
-          <TouchableOpacity style={styles.pinnedBar} onPress={() => {
-            const idx = messages.findIndex(m => m.id === pinnedMessage.id);
-            if (idx >= 0) flatListRef.current?.scrollToIndex({ index: idx, animated: true });
-          }}>
+          <View style={styles.pinnedBar}>
             <Ionicons name="pin" size={14} color={COLORS.primaryLight} />
             <Text style={styles.pinnedBarText} numberOfLines={1}>{pinnedMessage.content}</Text>
-            <TouchableOpacity onPress={async () => {
-              try { await chatsAPI.unpinMessage(id!); setPinnedMessage(null); } catch (e) { console.log(e); }
-            }}>
+            <TouchableOpacity onPress={() => setPinnedMessage(null)}>
               <Ionicons name="close" size={16} color={COLORS.textMuted} />
             </TouchableOpacity>
-          </TouchableOpacity>
+          </View>
+        )}
+
+        {/* Search bar */}
+        {showSearch && (
+          <View style={styles.searchBar}>
+            <Ionicons name="search" size={18} color={COLORS.textMuted} />
+            <TextInput
+              style={styles.searchInput}
+              value={searchQuery}
+              onChangeText={setSearchQuery}
+              placeholder="Nachrichten suchen..."
+              placeholderTextColor={COLORS.textMuted}
+              autoFocus
+            />
+            <TouchableOpacity onPress={() => { setShowSearch(false); setSearchQuery(''); }}>
+              <Ionicons name="close" size={20} color={COLORS.textMuted} />
+            </TouchableOpacity>
+          </View>
         )}
 
         {/* Messages */}
         <FlatList
+          testID="messages-list"
           ref={flatListRef}
-          data={filteredMessages}
+          data={messages}
           renderItem={renderMessage}
           keyExtractor={(item) => item.id}
           contentContainerStyle={styles.messagesList}
-          onContentSizeChange={() => flatListRef.current?.scrollToEnd({ animated: false })}
-          onLayout={() => flatListRef.current?.scrollToEnd({ animated: false })}
+          inverted
           ListEmptyComponent={
-            searchQuery.trim() ? (
-              <View style={styles.emptyMessages}>
-                <Text style={styles.emptyText}>Keine Ergebnisse für "{searchQuery}"</Text>
+            <View style={styles.emptyMessages}>
+              <View style={styles.emptyIconCircle}>
+                <Ionicons name="chatbubble-ellipses" size={32} color={COLORS.primaryLight} />
               </View>
-            ) : (
-              <View style={styles.emptyMessages}>
-                <View style={styles.emptyIconCircle}>
-                  <Ionicons name={isE2EESessionActive ? 'lock-closed' : 'lock-open'} size={32} color={isE2EESessionActive ? '#4CAF50' : COLORS.primaryLight} />
-                </View>
-                <Text style={styles.emptyText}>
-                  {isE2EESessionActive ? 'Verschlüsselter Kanal bereit' : 'Kanal bereit'}
-                </Text>
-                <Text style={styles.emptySubtext}>
-                  {isE2EESessionActive
-                    ? 'Nachrichten sind Ende-zu-Ende verschlüsselt (Double Ratchet)'
-                    : 'Tippe auf das Schloss oben rechts für E2EE-Info'}
-                </Text>
-              </View>
-            )
+              <Text style={styles.emptyText}>Noch keine Nachrichten</Text>
+              <Text style={styles.emptySubtext}>Sende die erste Nachricht</Text>
+            </View>
           }
+          onEndReached={() => {
+            if (messages.length > 0 && !loading) {
+              loadOlderMessages();
+            }
+          }}
+          onEndReachedThreshold={0.3}
         />
+
+        {/* E2EE info when not active */}
+        {!isE2EESessionActive && !chat?.is_group && (
+          <View style={{ paddingHorizontal: 16, paddingVertical: 6, backgroundColor: `${COLORS.warning}10` }}>
+            <Text style={{ fontSize: FONTS.sizes.xs, color: COLORS.warning, textAlign: 'center' }}>
+              {e2eeFingerprint
+                ? 'E2EE aktiv — Tippe auf das Schloss oben rechts für E2EE-Info'
+                : 'Tippe auf das Schloss oben rechts für E2EE-Info'}
+            </Text>
+          </View>
+        )}
 
         {/* Typing indicator */}
         {typingUsers.length > 0 && (
@@ -1321,7 +1191,7 @@ export default function ChatDetailScreen() {
             )}
           </View>
         )}
-      </KeyboardAvoidingView>
+      </View>
 
       {/* Group Info Modal */}
       <Modal visible={showGroupInfo} animationType="slide" transparent>

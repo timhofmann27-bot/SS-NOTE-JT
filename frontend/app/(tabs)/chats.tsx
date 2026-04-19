@@ -1,40 +1,77 @@
-import React, { useState, useCallback, useEffect } from 'react';
+import React, { useState, useCallback, useEffect, useRef } from 'react';
 import { View, Text, TouchableOpacity, StyleSheet, FlatList, ActivityIndicator } from 'react-native';
 import { useRouter, useFocusEffect } from 'expo-router';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import { useAuth } from '../../src/context/AuthContext';
+import { useChat } from '../../src/context/ChatContext';
 import { chatsAPI } from '../../src/utils/api';
 import { COLORS, FONTS, SPACING, ROLES } from '../../src/utils/theme';
 
-export default function ChatsScreen() {
-  const [chats, setChats] = useState<any[]>([]);
-  const [loading, setLoading] = useState(true);
-  const { user } = useAuth();
-  const router = useRouter();
+const PAGE_SIZE = 20;
 
-  const loadChats = useCallback(async () => {
+export default function ChatsScreen() {
+  const [loading, setLoading] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [allChats, setAllChats] = useState<any[]>([]);
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
+  const [hasMore, setHasMore] = useState(true);
+  const { user } = useAuth();
+  const { chats, isConnected, refreshChats } = useChat();
+  const router = useRouter();
+  const loadingRef = useRef(false);
+
+  const loadChats = useCallback(async (cursor?: string | null, append = false) => {
+    if (loadingRef.current) return;
+    loadingRef.current = true;
+
     try {
-      const res = await chatsAPI.list();
-      setChats(res.data.chats || []);
+      if (!cursor) {
+        setLoading(true);
+      } else {
+        setLoadingMore(true);
+      }
+
+      const res = await chatsAPI.list({ limit: PAGE_SIZE, cursor: cursor || undefined });
+      const newChats = res.data.chats || [];
+      const returnedCursor = res.data.next_cursor || null;
+      const returnedHasMore = res.data.has_more || false;
+
+      if (append) {
+        setAllChats((prev) => {
+          const existingIds = new Set(prev.map((c) => c.id));
+          const uniqueNew = newChats.filter((c: any) => !existingIds.has(c.id));
+          return [...prev, ...uniqueNew];
+        });
+      } else {
+        setAllChats(newChats);
+      }
+
+      setNextCursor(returnedCursor);
+      setHasMore(returnedHasMore);
     } catch (e) {
       console.log('Error loading chats', e);
     } finally {
       setLoading(false);
+      setLoadingMore(false);
+      loadingRef.current = false;
     }
   }, []);
 
-  useFocusEffect(useCallback(() => { loadChats(); }, [loadChats]));
+  const loadMore = useCallback(() => {
+    if (!loadingMore && hasMore && nextCursor) {
+      loadChats(nextCursor, true);
+    }
+  }, [loadingMore, hasMore, nextCursor, loadChats]);
 
-  useEffect(() => {
-    const interval = setInterval(async () => {
-      try {
-        const res = await chatsAPI.pollUpdates();
-        setChats(res.data.chats || []);
-      } catch {}
-    }, 5000);
-    return () => clearInterval(interval);
-  }, []);
+  useFocusEffect(
+    useCallback(() => {
+      setAllChats([]);
+      setNextCursor(null);
+      setHasMore(true);
+      loadChats(null, false);
+    }, [loadChats])
+  );
 
   const getOtherParticipant = (chat: any) => {
     if (!chat.participants) return null;
@@ -165,6 +202,36 @@ export default function ChatsScreen() {
     );
   };
 
+  const renderFooter = () => {
+    if (!loadingMore) return null;
+    return (
+      <View style={styles.footerLoader}>
+        <ActivityIndicator size="small" color={COLORS.primaryLight} />
+      </View>
+    );
+  };
+
+  const renderEmpty = () => {
+    if (loading) return null;
+    return (
+      <View style={styles.emptyContainer}>
+        <View style={styles.emptyIcon}>
+          <Ionicons name="chatbubbles-outline" size={48} color={COLORS.textMuted} />
+        </View>
+        <Text style={styles.emptyTitle}>Noch keine Chats</Text>
+        <Text style={styles.emptySubtitle}>Erstelle einen neuen Chat oder eine Gruppe</Text>
+        <TouchableOpacity
+          testID="empty-new-chat-btn"
+          style={styles.emptyCta}
+          onPress={() => router.push('/new-chat')}
+        >
+          <Ionicons name="add" size={18} color={COLORS.white} />
+          <Text style={styles.emptyCtaText}>Neuen Chat starten</Text>
+        </TouchableOpacity>
+      </View>
+    );
+  };
+
   if (loading) {
     return (
       <View style={styles.center}>
@@ -175,29 +242,24 @@ export default function ChatsScreen() {
 
   return (
     <View style={styles.container}>
-      {chats.length === 0 ? (
-        <View style={styles.emptyContainer}>
-          <View style={styles.emptyIcon}>
-            <Ionicons name="chatbubbles-outline" size={48} color={COLORS.textMuted} />
-          </View>
-          <Text style={styles.emptyTitle}>Noch keine Chats</Text>
-          <Text style={styles.emptySubtitle}>Erstelle einen neuen Chat oder eine Gruppe</Text>
-          <TouchableOpacity
-            testID="empty-new-chat-btn"
-            style={styles.emptyCta}
-            onPress={() => router.push('/new-chat')}
-          >
-            <Ionicons name="add" size={18} color={COLORS.white} />
-            <Text style={styles.emptyCtaText}>Neuen Chat starten</Text>
-          </TouchableOpacity>
+      {!isConnected && (
+        <View style={styles.offlineBanner}>
+          <Ionicons name="cloud-offline" size={14} color={COLORS.warning} />
+          <Text style={styles.offlineText}>Verbindung getrennt – Warte auf Reconnect...</Text>
         </View>
+      )}
+      {allChats.length === 0 ? (
+        renderEmpty()
       ) : (
         <FlatList
-          data={chats}
+          data={allChats}
           renderItem={renderChat}
           keyExtractor={(item) => item.id}
           contentContainerStyle={styles.listContent}
           ItemSeparatorComponent={() => <View style={styles.separator} />}
+          onEndReached={loadMore}
+          onEndReachedThreshold={0.3}
+          ListFooterComponent={renderFooter}
         />
       )}
 
@@ -216,6 +278,8 @@ const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: COLORS.background },
   center: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: COLORS.background },
   listContent: { paddingVertical: 8 },
+  offlineBanner: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6, paddingVertical: 6, backgroundColor: `${COLORS.warning}15`, borderBottomWidth: 1, borderBottomColor: `${COLORS.warning}30` },
+  offlineText: { fontSize: FONTS.sizes.xs, color: COLORS.warning, fontWeight: FONTS.weights.medium },
   chatItem: { flexDirection: 'row', paddingHorizontal: 16, paddingVertical: 12, alignItems: 'center' },
   avatarContainer: { position: 'relative', marginRight: 14 },
   avatar: {
@@ -256,4 +320,5 @@ const styles = StyleSheet.create({
     backgroundColor: COLORS.primary, alignItems: 'center', justifyContent: 'center',
     elevation: 8, shadowColor: '#000', shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.3, shadowRadius: 8,
   },
+  footerLoader: { paddingVertical: 20, alignItems: 'center' },
 });

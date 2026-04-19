@@ -19,10 +19,13 @@ class TestE2EEKeyManagement:
         token = reg.json()["token"]
         api_client.headers["Authorization"] = f"Bearer {token}"
 
-        resp = api_client.post(f"{base_url}/api/keys/upload", json={
-            "public_key": "dGVzdHB1YmxpY2tleQ==",
-            "fingerprint": "AA:BB:CC:DD:EE:FF",
-        })
+        resp = api_client.post(
+            f"{base_url}/api/keys/upload",
+            json={
+                "public_key": "dGVzdHB1YmxpY2tleQ==",
+                "fingerprint": "AA:BB:CC:DD:EE:FF",
+            },
+        )
         assert resp.status_code == 200
         data = resp.json()
         assert "message" in data
@@ -40,10 +43,13 @@ class TestE2EEKeyManagement:
         token = reg.json()["token"]
         api_client.headers["Authorization"] = f"Bearer {token}"
 
-        api_client.post(f"{base_url}/api/keys/upload", json={
-            "public_key": "dGVzdHB1YmxpY2tleWI=",
-            "fingerprint": "11:22:33:44",
-        })
+        api_client.post(
+            f"{base_url}/api/keys/upload",
+            json={
+                "public_key": "dGVzdHB1YmxpY2tleWI=",
+                "fingerprint": "11:22:33:44",
+            },
+        )
 
         me = api_client.get(f"{base_url}/api/auth/me")
         my_id = me.json()["user"]["id"]
@@ -90,21 +96,27 @@ class TestE2EEEncryptedMessages:
         token = reg.json()["token"]
         api_client.headers["Authorization"] = f"Bearer {token}"
 
-        chat_resp = api_client.post(f"{base_url}/api/chats", json={
-            "participant_ids": [],
-            "is_group": False,
-        })
+        chat_resp = api_client.post(
+            f"{base_url}/api/chats",
+            json={
+                "participant_ids": [],
+                "is_group": False,
+            },
+        )
         assert chat_resp.status_code == 200
         chat_id = chat_resp.json()["chat"]["id"]
 
-        resp = api_client.post(f"{base_url}/api/messages/encrypted", json={
-            "chat_id": chat_id,
-            "ciphertext": "ZW5jcnlwdGVkY29udGVudA==",
-            "nonce": "bm9uY2V2YWx1ZQ==",
-            "dh_public": "ZGhwdWJsaWNrZXk=",
-            "msg_num": 0,
-            "security_level": "UNCLASSIFIED",
-        })
+        resp = api_client.post(
+            f"{base_url}/api/messages/encrypted",
+            json={
+                "chat_id": chat_id,
+                "ciphertext": "ZW5jcnlwdGVkY29udGVudA==",
+                "nonce": "bm9uY2V2YWx1ZQ==",
+                "dh_public": "ZGhwdWJsaWNrZXk=",
+                "msg_num": 0,
+                "security_level": "UNCLASSIFIED",
+            },
+        )
         assert resp.status_code == 200
         data = resp.json()
         assert data["message"]["encrypted"] is True
@@ -124,22 +136,28 @@ class TestE2EEEncryptedMessages:
         token = reg.json()["token"]
         api_client.headers["Authorization"] = f"Bearer {token}"
 
-        chat_resp = api_client.post(f"{base_url}/api/chats", json={
-            "participant_ids": [],
-            "is_group": False,
-        })
+        chat_resp = api_client.post(
+            f"{base_url}/api/chats",
+            json={
+                "participant_ids": [],
+                "is_group": False,
+            },
+        )
         chat_id = chat_resp.json()["chat"]["id"]
 
-        resp = api_client.post(f"{base_url}/api/messages/encrypted", json={
-            "chat_id": chat_id,
-            "ciphertext": "ZW5jcnlwdGVkY29udGVudA==",
-            "nonce": "bm9uY2V2YWx1ZQ==",
-            "dh_public": "ZGhwdWJsaWNrZXk=",
-            "msg_num": 0,
-            "message_type": "image",
-            "media_ciphertext": "ZW5jcnlwdGVkSW1hZ2VEYXRh",
-            "media_nonce": "bWVkaWFub25jZQ==",
-        })
+        resp = api_client.post(
+            f"{base_url}/api/messages/encrypted",
+            json={
+                "chat_id": chat_id,
+                "ciphertext": "ZW5jcnlwdGVkY29udGVudA==",
+                "nonce": "bm9uY2V2YWx1ZQ==",
+                "dh_public": "ZGhwdWJsaWNrZXk=",
+                "msg_num": 0,
+                "message_type": "image",
+                "media_ciphertext": "ZW5jcnlwdGVkSW1hZ2VEYXRh",
+                "media_nonce": "bWVkaWFub25jZQ==",
+            },
+        )
         assert resp.status_code == 200
         data = resp.json()
         assert data["message"]["encrypted"] is True
@@ -161,21 +179,27 @@ class TestE2EEEncryptedMessages:
         token = reg.json()["token"]
         api_client.headers["Authorization"] = f"Bearer {token}"
 
-        chat_resp = api_client.post(f"{base_url}/api/chats", json={
-            "participant_ids": [],
-            "is_group": True,
-            "name": "Test Group",
-        })
+        chat_resp = api_client.post(
+            f"{base_url}/api/chats",
+            json={
+                "participant_ids": [],
+                "is_group": True,
+                "name": "Test Group",
+            },
+        )
         chat_id = chat_resp.json()["chat"]["id"]
 
-        resp = api_client.post(f"{base_url}/api/messages/encrypted", json={
-            "chat_id": chat_id,
-            "ciphertext": "Z3JvdXBFbmNyeXB0ZWQ=",
-            "nonce": "Z3JvdXBub25jZQ==",
-            "sender_key_id": "sender-key-12345",
-            "sender_key_iteration": 5,
-            "message_type": "text",
-        })
+        resp = api_client.post(
+            f"{base_url}/api/messages/encrypted",
+            json={
+                "chat_id": chat_id,
+                "ciphertext": "Z3JvdXBFbmNyeXB0ZWQ=",
+                "nonce": "Z3JvdXBub25jZQ==",
+                "sender_key_id": "sender-key-12345",
+                "sender_key_iteration": 5,
+                "message_type": "text",
+            },
+        )
         assert resp.status_code == 200
         data = resp.json()
         assert data["message"]["encrypted"] is True
@@ -197,11 +221,14 @@ class TestE2EEEncryptedMessages:
         api_client.headers["Authorization"] = f"Bearer {token}"
 
         fake_chat_id = "507f191e810c19729de860ea"
-        resp = api_client.post(f"{base_url}/api/messages/encrypted", json={
-            "chat_id": fake_chat_id,
-            "ciphertext": "dGVzdA==",
-            "nonce": "bm9uY2U=",
-        })
+        resp = api_client.post(
+            f"{base_url}/api/messages/encrypted",
+            json={
+                "chat_id": fake_chat_id,
+                "ciphertext": "dGVzdA==",
+                "nonce": "bm9uY2U=",
+            },
+        )
         assert resp.status_code == 404
 
     def test_invalid_base64_rejected(self, api_client, base_url):
@@ -217,17 +244,23 @@ class TestE2EEEncryptedMessages:
         token = reg.json()["token"]
         api_client.headers["Authorization"] = f"Bearer {token}"
 
-        chat_resp = api_client.post(f"{base_url}/api/chats", json={
-            "participant_ids": [],
-            "is_group": False,
-        })
+        chat_resp = api_client.post(
+            f"{base_url}/api/chats",
+            json={
+                "participant_ids": [],
+                "is_group": False,
+            },
+        )
         chat_id = chat_resp.json()["chat"]["id"]
 
-        resp = api_client.post(f"{base_url}/api/messages/encrypted", json={
-            "chat_id": chat_id,
-            "ciphertext": "!!!invalid-base64!!!",
-            "nonce": "bm9uY2U=",
-        })
+        resp = api_client.post(
+            f"{base_url}/api/messages/encrypted",
+            json={
+                "chat_id": chat_id,
+                "ciphertext": "!!!invalid-base64!!!",
+                "nonce": "bm9uY2U=",
+            },
+        )
         assert resp.status_code == 400
 
     def test_invalid_media_base64_rejected(self, api_client, base_url):
@@ -243,18 +276,24 @@ class TestE2EEEncryptedMessages:
         token = reg.json()["token"]
         api_client.headers["Authorization"] = f"Bearer {token}"
 
-        chat_resp = api_client.post(f"{base_url}/api/chats", json={
-            "participant_ids": [],
-            "is_group": False,
-        })
+        chat_resp = api_client.post(
+            f"{base_url}/api/chats",
+            json={
+                "participant_ids": [],
+                "is_group": False,
+            },
+        )
         chat_id = chat_resp.json()["chat"]["id"]
 
-        resp = api_client.post(f"{base_url}/api/messages/encrypted", json={
-            "chat_id": chat_id,
-            "ciphertext": "dmFsaWRjaXBoZXI=",
-            "nonce": "bm9uY2U=",
-            "media_ciphertext": "!!!invalid!!!",
-        })
+        resp = api_client.post(
+            f"{base_url}/api/messages/encrypted",
+            json={
+                "chat_id": chat_id,
+                "ciphertext": "dmFsaWRjaXBoZXI=",
+                "nonce": "bm9uY2U=",
+                "media_ciphertext": "!!!invalid!!!",
+            },
+        )
         assert resp.status_code == 400
 
     def test_get_messages_returns_encrypted_content(self, api_client, base_url):
@@ -270,19 +309,25 @@ class TestE2EEEncryptedMessages:
         token = reg.json()["token"]
         api_client.headers["Authorization"] = f"Bearer {token}"
 
-        chat_resp = api_client.post(f"{base_url}/api/chats", json={
-            "participant_ids": [],
-            "is_group": False,
-        })
+        chat_resp = api_client.post(
+            f"{base_url}/api/chats",
+            json={
+                "participant_ids": [],
+                "is_group": False,
+            },
+        )
         chat_id = chat_resp.json()["chat"]["id"]
 
-        api_client.post(f"{base_url}/api/messages/encrypted", json={
-            "chat_id": chat_id,
-            "ciphertext": "c2VjcmV0bWVzc2FnZQ==",
-            "nonce": "bm9uY2V2YWx1ZQ==",
-            "dh_public": "ZGhwdWJsaWNrZXk=",
-            "msg_num": 0,
-        })
+        api_client.post(
+            f"{base_url}/api/messages/encrypted",
+            json={
+                "chat_id": chat_id,
+                "ciphertext": "c2VjcmV0bWVzc2FnZQ==",
+                "nonce": "bm9uY2V2YWx1ZQ==",
+                "dh_public": "ZGhwdWJsaWNrZXk=",
+                "msg_num": 0,
+            },
+        )
 
         msgs = api_client.get(f"{base_url}/api/messages/{chat_id}")
         assert msgs.status_code == 200
@@ -290,4 +335,3 @@ class TestE2EEEncryptedMessages:
         assert len(messages) >= 1
         assert messages[0]["e2ee"] is True
         assert messages[0]["encrypted"] is True
-
